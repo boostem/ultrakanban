@@ -439,6 +439,11 @@ const MIGRATIONS = [
   ALTER TABLE token_usage ADD COLUMN jev_effort TEXT;
   ALTER TABLE token_usage ADD COLUMN jev_confidence REAL;
   `,
+  `
+  -- What Jev was told about the ticket when it picked (a hash of its content, see contentKey in server/jev-routing.ts),
+  -- so a ticket whose content hasn't changed since isn't sent to Jev again.
+  ALTER TABLE ticket_routes ADD COLUMN content_key TEXT;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

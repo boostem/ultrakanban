@@ -444,6 +444,10 @@ const MIGRATIONS = [
   -- so a ticket whose content hasn't changed since isn't sent to Jev again.
   ALTER TABLE ticket_routes ADD COLUMN content_key TEXT;
   `,
+  `
+  -- How Jev's pick and the history suggestion combine (see BoardSummary.jevCombine; JEV_DEFAULTS when NULL).
+  ALTER TABLE boards ADD COLUMN jev_combine TEXT;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

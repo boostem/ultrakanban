@@ -36,6 +36,7 @@ export type BoardPatch = Partial<
     | 'jevModels'
     | 'jevThreshold'
     | 'jevOnlyLower'
+    | 'jevCombine'
     | 'jevMode'
   >
 >

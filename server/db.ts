@@ -398,6 +398,10 @@ const MIGRATIONS = [
   -- default (AGENT_DEFAULTS.conflictConcurrency) when NULL.
   ALTER TABLE boards ADD COLUMN agent_conflict_concurrency INTEGER;
   `,
+  `
+  -- Path of a git repository on the host the board works on instead of a GitHub one (see BoardSummary).
+  ALTER TABLE boards ADD COLUMN local_repo_path TEXT;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

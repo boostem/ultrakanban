@@ -111,15 +111,23 @@ type JevSettings = Pick<
   'jevEnabled' | 'jevModels' | 'jevThreshold' | 'jevOnlyLower' | 'jevCombine' | 'jevMode'
 >
 
-/** The board's "Route with Jev" settings (see docs/JEV.md); only shown when a TypeSafe API key is set. */
-function JevFieldset({ value, onChange }: { value: JevSettings; onChange: (value: JevSettings) => void }) {
+/** The board's "Route with Jev" settings (see docs/JEV.md); greyed out and not saved without a TypeSafe API key. */
+function JevFieldset({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: JevSettings
+  onChange: (value: JevSettings) => void
+  disabled: boolean
+}) {
   const models = value.jevModels ?? [...AGENT_MODELS]
   const toggleModel = (model: AgentModelAlias, checked: boolean) => {
     const next = AGENT_MODELS.filter((each) => (each === model ? checked : models.includes(each)))
     if (next.length) onChange({ ...value, jevModels: next.length === AGENT_MODELS.length ? null : next })
   }
   return (
-    <fieldset className="grid gap-5 border-t pt-5">
+    <fieldset disabled={disabled} className="grid gap-5 border-t pt-5 disabled:opacity-50">
       <legend className="sr-only">Route with Jev</legend>
       <div className="grid gap-1">
         <label className="flex items-center gap-2 text-sm font-medium">
@@ -138,7 +146,8 @@ function JevFieldset({ value, onChange }: { value: JevSettings; onChange: (value
           Route with Jev
         </label>
         <p className="pl-6 text-xs text-muted-foreground">
-          Jev picks the model and effort for tickets that don't set their own.
+          Jev (TypeSafe) picks the model and effort for tickets that don't set their own.
+          {disabled && ' Needs a TypeSafe API key.'}
         </p>
       </div>
       {value.jevEnabled && (
@@ -200,11 +209,11 @@ function JevFieldset({ value, onChange }: { value: JevSettings; onChange: (value
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                Below it, the history suggestion or board setting is used.
+                Below it, the similar-tickets suggestion or board setting is used.
               </p>
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="board-settings-jev-combine">When Jev and the history suggestion disagree</Label>
+              <Label htmlFor="board-settings-jev-combine">When Jev and the similar-tickets suggestion disagree</Label>
               <Select
                 value={value.jevCombine ?? JEV_DEFAULTS.combine}
                 onValueChange={(combine) =>
@@ -216,13 +225,13 @@ function JevFieldset({ value, onChange }: { value: JevSettings; onChange: (value
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="jev-only">Use Jev only</SelectItem>
-                  <SelectItem value="jev-first">Prefer Jev (fall back to history)</SelectItem>
+                  <SelectItem value="jev-first">Prefer Jev (fall back to similar tickets)</SelectItem>
                   <SelectItem value="higher">Use the higher setting</SelectItem>
                   <SelectItem value="lower">Use the lower setting</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                The history suggestion is what similar finished tickets used.
+                The similar-tickets suggestion is what similar finished tickets used.
               </p>
             </div>
             <div className="grid gap-1">
@@ -604,7 +613,7 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
         </div>
       </fieldset>
 
-      {hasTypesafeKey && <JevFieldset value={jev} onChange={setJev} />}
+      <JevFieldset value={jev} onChange={setJev} disabled={!hasTypesafeKey} />
 
       <fieldset className="grid gap-3 border-t pt-4">
         <legend className="sr-only">Notifications</legend>

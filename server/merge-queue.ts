@@ -5,6 +5,7 @@ import {
   type MergePlanItem,
   type MergeRun,
   type MergeRunStep,
+  parseLocalPullRequestUrl,
   type Ticket,
 } from '../shared/domain.ts'
 import { parseChecklist } from '../shared/checklist.ts'
@@ -193,6 +194,10 @@ export function createMergeQueue(
       overlaps: [],
       warning: null,
       skip: null,
+    }
+    if (parseLocalPullRequestUrl(url)) {
+      item.skip = 'A local pull request: merge it on its page'
+      return { item, index, pullRequest: null, files: new Set() }
     }
     try {
       const pullRequest = await fetchSettled(repo, number)

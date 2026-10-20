@@ -4,9 +4,12 @@ import { formatBytes, formatModel, formatRunOutcome, formatRunTotals } from './f
 
 describe('run records', () => {
   test('say what a run took, leaving out what it did not report', () => {
-    assert.equal(formatRunTotals({ durationMs: 23 * 60_000, turns: 41, costUsd: 1.2 }), '23m · 41 turns · $1.20')
-    assert.equal(formatRunTotals({ durationMs: 30_000, turns: 1, costUsd: null }), '<1m · 1 turn')
-    assert.equal(formatRunTotals({ durationMs: null, turns: null, costUsd: null }), '')
+    assert.equal(
+      formatRunTotals({ durationMs: 23 * 60_000, turns: 41, tokens: 1_234_567, costUsd: 1.2 }),
+      '23m · 41 turns · 1.2M tokens · $1.20',
+    )
+    assert.equal(formatRunTotals({ durationMs: 30_000, turns: 1, tokens: null, costUsd: null }), '<1m · 1 turn')
+    assert.equal(formatRunTotals({ durationMs: null, turns: null, tokens: null, costUsd: null }), '')
   })
 
   test('say how a run ended', () => {

@@ -649,6 +649,11 @@ export interface AgentRun {
   /** What the run is doing, as its agent last said, e.g. "Answering review feedback". */
   step: string | null
   /**
+   * Tokens the run has used so far (input, output and cache, subagents included), as its agent last said; null until
+   * it does.
+   */
+  tokens: number | null
+  /**
    * When someone asked for the run to stop (`POST /tickets/:id/stop`) and who, until it ends: the agent loop stops it
    * at its next check of the ticket, keeping its session and work, and resumes it once there is new feedback. Null
    * while nobody has.
@@ -899,6 +904,8 @@ export interface RunRecord {
   durationMs: number | null
   /** How many turns (responses of the model) the run took. */
   turns: number | null
+  /** Tokens the run used (input, output and cache, see `totalTokens`), when the agent reports them. */
+  tokens: number | null
   /** Estimated cost in US dollars, when the agent reports one. */
   costUsd: number | null
   /**

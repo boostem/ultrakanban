@@ -11,6 +11,7 @@ interface RunRow {
   exit_code: number | null
   duration_ms: number | null
   turns: number | null
+  tokens: number | null
   cost_usd: number | null
   message: string
   steps: string
@@ -27,6 +28,7 @@ const toRun = (row: RunRow): RunRecord => ({
   exitCode: row.exit_code,
   durationMs: row.duration_ms,
   turns: row.turns,
+  tokens: row.tokens,
   costUsd: row.cost_usd,
   message: row.message,
   steps: JSON.parse(row.steps) as RunStep[],
@@ -53,15 +55,16 @@ export function recordRun(ticketId: string, input: RecordRun): RunRecord {
   touchBoard(ticket.boardId)
   const { lastInsertRowid } = sql.run(
     `INSERT INTO run_records
-       (ticket_id, agent, outcome, exit_code, duration_ms, turns, cost_usd, message, steps, omitted_after,
-        omitted_count, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (ticket_id, agent, outcome, exit_code, duration_ms, turns, tokens, cost_usd, message, steps,
+        omitted_after, omitted_count, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ticket.id,
     input.agent,
     input.outcome,
     input.exitCode,
     input.durationMs,
     input.turns,
+    input.tokens,
     input.costUsd,
     input.message,
     JSON.stringify(input.steps),

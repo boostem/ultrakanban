@@ -524,8 +524,9 @@ $task$( ((steps)) && unchecked_steps "$id")$notes"
           '{id: $id, checkout: $checkout, worker: $worker}')"
       run_claude "$id" "$prompt" "$start" "$session"
       code=$?
-      # The session is gone (e.g. claude's history was cleared, or it was in another checkout claude doesn't look
-      # in): run again at once as a new session, with the whole prompt.
+      # The session is gone (e.g. claude's history was cleared): run again at once as a new session, with the whole
+      # prompt. A session from another checkout isn't: claude --resume finds a session id in any project directory,
+      # and the resumed run works in this one (checked with Claude Code 2.1.304).
       if [[ $code != 0 && $start == --resume && -z $claude_stopped && -z $claude_stop_requested &&
         $claude_errors == *"No conversation found"* ]]; then
         log "can't resume the session of the previous run on $id; starting a new one"

@@ -1263,14 +1263,19 @@ export interface ClaudeUsage {
   reportedAt: string | null
   /** The subscription, e.g. "pro" or "max". */
   plan: string | null
+  /**
+   * When `limits` were read; null if they never were. A report with only an error keeps the last limits, so this can be
+   * older than `reportedAt`.
+   */
+  limitsAt: string | null
   limits: ClaudeUsageLimit[]
-  /** Why the last report has no limits, e.g. no claude login on the host. */
+  /** Why the last report has no usage, e.g. no claude login on the host; the last limits stay until they go stale. */
   error: string | null
   /** How far agents may use the week and the current session (see `ClaudeUsageReserve`). */
   reserve: ClaudeUsageReserve
   /**
    * The limit that holds agents back right now: one at or over its reserve (see `reserveFor`) that hasn't reset since,
-   * when the report is fresh (see `CLAUDE_USAGE_FRESH_MINUTES`). Of several, the one that resets last (the most used of
+   * when the limits are fresh (`limitsAt`, see `CLAUDE_USAGE_FRESH_MINUTES`). Of several, the one that resets last (the most used of
    * those that reset together), as agents claim again only once all of them have. Null otherwise.
    */
   reserveReached: ClaudeUsageLimit | null

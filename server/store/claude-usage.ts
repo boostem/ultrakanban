@@ -4,6 +4,7 @@ import { now, sql } from '../db.ts'
 
 interface ClaudeUsageRow {
   reported_at: string | null
+  limits_at: string | null
   plan: string | null
   limits: string
   error: string | null
@@ -20,14 +21,15 @@ const liftsAfter = (a: ClaudeUsageLimit, b: ClaudeUsageLimit) =>
 
 /**
  * The limit that holds agents back with the usage reserve at `at` (see `ClaudeUsage.reserveReached`): of the limits at
- * or over their reserve that haven't reset since the report, the one that lifts last, when the report is fresh. A
- * stale or missing report never holds them back, so agents don't stop with a supervisor that did.
+ * or over their reserve that haven't reset since they were read, the one that lifts last, when they are fresh. Stale
+ * or missing limits never hold them back (they fail open), so agents don't stop with a supervisor that did, or one
+ * that can't read the usage any more.
  */
 export function reserveReached(
-  { reportedAt, limits, reserve }: Pick<ClaudeUsage, 'reportedAt' | 'limits' | 'reserve'>,
+  { limitsAt, limits, reserve }: Pick<ClaudeUsage, 'limitsAt' | 'limits' | 'reserve'>,
   at = Date.now(),
 ): ClaudeUsageLimit | null {
-  if (!reportedAt || Date.parse(reportedAt) < at - CLAUDE_USAGE_FRESH_MINUTES * 60_000) return null
+  if (!limitsAt || Date.parse(limitsAt) < at - CLAUDE_USAGE_FRESH_MINUTES * 60_000) return null
   const reached = limits.filter((limit) => {
     const percent = reserveFor(limit, reserve)
     // Past its reset time a limit starts again from nothing, even before the next report says so.
@@ -43,6 +45,7 @@ export function reserveReached(
 function toClaudeUsage(row: ClaudeUsageRow): ClaudeUsage {
   const usage = {
     reportedAt: row.reported_at,
+    limitsAt: row.limits_at,
     plan: row.plan,
     limits: JSON.parse(row.limits) as ClaudeUsageLimit[],
     error: row.error,
@@ -110,15 +113,19 @@ export function parseClaudeUsage(usage: Record<string, unknown>): ClaudeUsageLim
   })
 }
 
-/** Records what the supervisor read; a report with neither usage nor an error only updates the plan and the time. */
+/**
+ * Records what the supervisor read. A report without usage (with only an error, or nothing) keeps the last limits and
+ * when they were read, so one failed read doesn't lift the usage reserve: they hold until they go stale.
+ */
 export function reportClaudeUsage(input: ReportClaudeUsageInput): ClaudeUsage {
   const current = getClaudeUsage()
-  const limits = input.usage ? parseClaudeUsage(input.usage) : input.error ? [] : current.limits
+  const at = now()
   sql.run(
-    'UPDATE claude_usage SET reported_at = ?, plan = ?, limits = ?, error = ? WHERE id = 1',
-    now(),
+    'UPDATE claude_usage SET reported_at = ?, plan = ?, limits = ?, limits_at = ?, error = ? WHERE id = 1',
+    at,
     input.plan === undefined ? current.plan : input.plan,
-    JSON.stringify(limits),
+    JSON.stringify(input.usage ? parseClaudeUsage(input.usage) : current.limits),
+    input.usage ? at : current.limitsAt,
     input.usage ? null : (input.error ?? current.error),
   )
   return getClaudeUsage()

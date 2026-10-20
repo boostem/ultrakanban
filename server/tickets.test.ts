@@ -213,6 +213,30 @@ describe('agent claiming', () => {
     assert.equal((await claim()).body.title, 'waiting')
   })
 
+  test('claiming a specific ticket refuses blocked ones', async () => {
+    const blocker = await addTicket({ title: 'blocker', column: 'Doing' })
+    const tagged = await addTicket({ title: 'tagged', tags: ['blocked'] })
+    const waiting = await addTicket({ title: 'waiting', description: `Blocked by #${blocker.number}` })
+    const parent = await addTicket({ title: 'parent' })
+    await call('POST', `/tickets/${parent.id}/children`, { title: 'child', column: 'Todo' })
+
+    const claim = (id: string, agent = 'a') => call<Ticket & ApiErrorBody>('POST', `/tickets/${id}/claim`, { agent })
+    for (const ticket of [tagged, waiting, parent]) {
+      const refused = await claim(ticket.id)
+      assert.equal(refused.status, 409)
+      assert.equal(refused.body.error.code, 'blocked')
+      assert.equal((await call<Ticket>('GET', `/tickets/${ticket.id}`)).body.assignee, null)
+    }
+
+    await call('POST', `/tickets/${blocker.id}/move`, { column: 'Done' })
+    assert.equal((await claim(waiting.id)).status, 200)
+
+    // A ticket an agent already holds stays claimable by it, even once it is blocked.
+    await call('PATCH', `/tickets/${waiting.id}`, { tags: ['blocked'] })
+    assert.equal((await claim(waiting.id)).status, 200)
+    assert.equal((await claim(waiting.id, 'b')).body.error.code, 'already_claimed')
+  })
+
   test('records activity', async () => {
     const ticket = await addTicket({ title: 'A' })
     await call('POST', `/tickets/${ticket.id}/claim`, { agent: 'alpha', moveTo: 'Done' })
@@ -277,6 +301,30 @@ describe('idle tickets', () => {
     assert.deepEqual(
       activity.slice(-2).map((entry) => entry.type),
       ['released', 'moved'],
+    )
+  })
+
+  test('releasing into the done column skips tickets that cannot enter it instead of failing the batch', async () => {
+    await call('PATCH', `/boards/${boardId}`, { doneColumn: 'Done' })
+    const stuck = await addTicket({ title: 'Stuck' })
+    const asked = await addTicket({ title: 'Asked', tags: ['question'] })
+    for (const ticket of [stuck, asked]) {
+      await call('POST', `/tickets/${ticket.id}/claim`, { agent: 'alpha', moveTo: 'Doing' })
+    }
+    const column = await doingColumn()
+
+    const released = await later(AGENT_IDLE_MINUTES + 1, () =>
+      call<Ticket[]>('POST', `/columns/${column.id}/release-idle`, { moveTo: 'Done' }),
+    )
+
+    assert.equal(released.status, 200)
+    assert.deepEqual(
+      released.body.map((ticket) => ticket.title),
+      ['Asked'],
+    )
+    assert.deepEqual(
+      (await ticketsIn('Doing')).map((ticket) => [ticket.title, ticket.assignee]),
+      [['Stuck', 'alpha']],
     )
   })
 
@@ -496,6 +544,20 @@ describe('boards', () => {
     assert.equal(after.tickets[0].columnId, after.columns[1].id)
   })
 
+  test('deleting a column with tickets needs moveTicketsTo or deleteTickets', async () => {
+    await addTicket({ title: 'A', column: 'Doing' })
+    const { body: board } = await call<BoardDetail>('GET', `/boards/${boardId}`)
+    const id = board.columns[1].id
+
+    const refused = await call('DELETE', `/columns/${id}`)
+    assert.equal(refused.status, 409)
+    const deleted = await call('DELETE', `/columns/${id}?deleteTickets=true`)
+    const { body: after } = await call<BoardDetail>('GET', `/boards/${boardId}`)
+
+    assert.equal(deleted.status, 204)
+    assert.equal(after.tickets.length, 0)
+  })
+
   test('export/import round-trips a board', async () => {
     const ticket = await addTicket({ title: 'A', column: 'Done', tags: ['x'], priority: 'high', agentEffort: 'low' })
     await call('POST', `/tickets/${ticket.id}/comments`, { body: 'hello' })
@@ -515,6 +577,24 @@ describe('boards', () => {
     unsubscribe()
 
     assert.deepEqual(events, [boardId])
+  })
+})
+
+describe('ticket search', () => {
+  test('matches the search text literally, not as LIKE wildcards', async () => {
+    await addTicket({ title: 'Half of it is done 50% now' })
+    await addTicket({ title: 'Five hundred' })
+    await addTicket({ title: 'Snake_case name' })
+    await addTicket({ title: 'Snakexcase name' })
+    await addTicket({ title: 'Back\\slash' })
+    await addTicket({ title: 'Backxslash' })
+
+    const titles = async (q: string) =>
+      (await call<Ticket[]>('GET', `/boards/${boardId}/tickets?q=${encodeURIComponent(q)}`)).body.map((t) => t.title)
+
+    assert.deepEqual(await titles('50%'), ['Half of it is done 50% now'])
+    assert.deepEqual(await titles('snake_case'), ['Snake_case name'])
+    assert.deepEqual(await titles('Back\\slash'), ['Back\\slash'])
   })
 })
 

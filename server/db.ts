@@ -444,6 +444,14 @@ const MIGRATIONS = [
   -- so a ticket whose content hasn't changed since isn't sent to Jev again.
   ALTER TABLE ticket_routes ADD COLUMN content_key TEXT;
   `,
+  `
+  -- Model and effort for the board agent's runs that only fix merge conflicts, and those that only fix failing CI (see
+  -- BoardSummary). AGENT_DEFAULTS' conflictModel, conflictEffort, ciModel and ciEffort when NULL.
+  ALTER TABLE boards ADD COLUMN agent_conflict_model TEXT;
+  ALTER TABLE boards ADD COLUMN agent_conflict_effort TEXT;
+  ALTER TABLE boards ADD COLUMN agent_ci_model TEXT;
+  ALTER TABLE boards ADD COLUMN agent_ci_effort TEXT;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

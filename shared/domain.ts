@@ -20,6 +20,14 @@ export type AgentEffort = (typeof AGENT_EFFORTS)[number]
 export const AGENT_MODELS = ['fable', 'opus', 'sonnet', 'haiku'] as const
 export type AgentModelAlias = (typeof AGENT_MODELS)[number]
 
+/** One-line hint on what each model suits and costs, shown in the model picker. */
+export const AGENT_MODEL_HINTS: Record<AgentModelAlias, string> = {
+  fable: 'Most capable, highest cost',
+  opus: 'Hard or multi-file work, high cost',
+  sonnet: 'Routine, well-scoped work, medium cost',
+  haiku: 'Mechanical edits, lowest cost',
+}
+
 /** Whether a model is one of Claude's: an alias (`AGENT_MODELS`) or a full name such as claude-opus-5-5. */
 export const isClaudeModel = (model: string) =>
   (AGENT_MODELS as readonly string[]).includes(model) || /^claude-/i.test(model)
@@ -81,7 +89,7 @@ export const TICKET_TEMPLATES: readonly TicketTemplate[] = [
     description:
       '## Steps to reproduce\n\n## Expected\n\n## Actual\n\n- [ ] Find the cause\n- [ ] Fix it\n- [ ] Add a test that would have caught it',
     tags: ['bug'],
-    agentEffort: 'medium',
+    agentEffort: 'high',
     agentModel: 'opus',
   },
   {
@@ -91,6 +99,14 @@ export const TICKET_TEMPLATES: readonly TicketTemplate[] = [
     tags: ['feature'],
     agentEffort: 'medium',
     agentModel: 'opus',
+  },
+  {
+    id: 'small',
+    name: 'Small change',
+    description: '## What to change\n\n- [ ] Make the change\n- [ ] Check it',
+    tags: ['chore'],
+    agentEffort: 'low',
+    agentModel: 'sonnet',
   },
   {
     id: 'question',
@@ -585,8 +601,20 @@ export interface AgentSettingStats {
   successRate: number
   /** Cost per ticket in US dollars, averaged by similarity over those that reported one; null when none did. */
   costUsd: number | null
+  /**
+   * Cost per finished ticket: `costUsd` over `successRate`, as each finished ticket also pays for the ones given up on.
+   * Null when none reported a cost or none was finished. Settings are compared by it.
+   */
+  costPerFinishedUsd: number | null
   /** Tokens per ticket, averaged by similarity. */
   tokens: number
+  /** Tokens per ticket weighted by kind (see `TOKEN_WEIGHTS`), averaged by similarity. */
+  weightedTokens: number
+  /**
+   * Weighted tokens per finished ticket, `weightedTokens` over `successRate`; null when none was finished. Settings are
+   * compared by it when they don't both have a `costPerFinishedUsd`.
+   */
+  weightedTokensPerFinished: number | null
   /** Those tickets, most similar first (at most 5). */
   similar: SimilarTicket[]
 }
@@ -764,6 +792,11 @@ export const ROUTING_MIN_FINISHED = 10
  * board has decided at least this many tickets at it.
  */
 export const ROUTING_MIN_SETTING_TICKETS = 3
+/**
+ * A setting is suggested (`GET /boards/:id/agent-suggestion`) only once at least this many similar decided tickets were
+ * worked at it: one says more about that ticket than about the setting.
+ */
+export const SUGGESTION_MIN_TICKETS = 2
 /** History routes a ticket only when its suggestion is built on at least this many similar tickets. */
 export const HISTORY_MIN_TICKETS = 3
 

@@ -876,15 +876,17 @@ login (from Claude's usage endpoint, what `/usage` in claude shows). `GET /syste
 {
   reportedAt: string | null // when the supervisor last reported; null if it never has
   plan: string | null // the subscription, e.g. "pro" or "max"
+  limitsAt: string | null // when the limits were read; older than reportedAt after a report with only an error
   limits: Array<{ label: string; percent: number; resetsAt: string | null }> // e.g. "Current session", "Week, all models"
-  error: string | null // why there are no limits, e.g. no claude login on the host
+  error: string | null // why the last report has no usage, e.g. no claude login on the host
   reserve: { week: number | null; session: number | null } // the usage reserve, 1-100 each (see below); null when off
   reserveReached: { label: string; percent: number; resetsAt: string | null } | null // the limit holding agents back now
 }
 ```
 
 The supervisor reports with `POST /system/claude-usage` and `{ plan?, usage?, error? }`: `usage` is the usage
-endpoint's answer as it is (the board picks the limits out of it), `error` says why it couldn't get one.
+endpoint's answer as it is (the board picks the limits out of it), `error` says why it couldn't get one. A report
+without `usage` keeps the last limits and their `limitsAt`, so one failed read doesn't lift the usage reserve.
 
 **The usage reserve** keeps some of the week, of the current session or both for people's own Claude sessions. It is
 one setting for the whole Claude account, not per board: `PUT /system/claude-usage/reserve` with
@@ -892,9 +894,10 @@ one setting for the whole Claude account, not per board: `PUT /system/claude-usa
 with the usage above. Once a weekly limit (`Week, all models` or a per-model one such as `Week, Opus`) is at or over
 `week`, or the current session at or over `session`, `claim-next` hands out no new tickets and answers
 `404 usage_reserve_reached`, with the limit and its reserve in `details`; `reserveReached` says which limit it is (of
-several, the one that resets last, as claiming starts again only once all of them have). It only goes by a fresh
-report, from the last 30 minutes (the supervisor reports every 5), and a limit counts as reset once its `resetsAt` has
-passed: a stale or missing report never holds agents back, so agents don't stop because the supervisor did. Only
+several, the one that resets last, as claiming starts again only once all of them have). It only goes by fresh
+limits, read in the last 30 minutes (`limitsAt`; the supervisor reports every 5), and a limit counts as reset once its
+`resetsAt` has passed: stale or missing limits never hold agents back (they fail open), so agents don't stop because
+the supervisor did, or because it can't read the usage any more. Only
 claiming new tickets stops. Tickets agents already hold still get runs for their feedback, and claiming a given ticket
 (`POST /tickets/:ticketId/claim`) still works, so work under way and pull requests in review aren't left halfway;
 Claude's own limits stop those runs when the session or the week runs out.

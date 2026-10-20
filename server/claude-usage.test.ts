@@ -12,6 +12,7 @@ describe('Claude usage', () => {
   test('shows the limits the supervisor last read', async () => {
     assert.deepEqual(await usage(), {
       reportedAt: null,
+      limitsAt: null,
       plan: null,
       limits: [],
       error: null,
@@ -33,6 +34,7 @@ describe('Claude usage', () => {
     })
     assert.equal(reported.status, 200)
     assert.ok(reported.body.reportedAt)
+    assert.equal(reported.body.limitsAt, reported.body.reportedAt)
     assert.equal(reported.body.plan, 'max')
     assert.deepEqual(reported.body.limits, [
       { label: 'Current session', percent: 3, resetsAt: '2026-10-05T23:00:00+00:00' },
@@ -40,14 +42,16 @@ describe('Claude usage', () => {
       { label: 'Week, Opus', percent: 0, resetsAt: null },
     ])
 
-    // Without usage it keeps what it had; an error replaces it.
+    // Without usage it keeps the limits and when they were read, with an error too: one failed read doesn't clear them.
     assert.equal((await report({})).body.limits.length, 3)
     const failed = await report({ error: 'No claude login on the host' })
     assert.deepEqual(
-      [failed.body.limits, failed.body.error, failed.body.plan],
-      [[], 'No claude login on the host', 'max'],
+      [failed.body.limits, failed.body.limitsAt, failed.body.error, failed.body.plan],
+      [reported.body.limits, reported.body.limitsAt, 'No claude login on the host', 'max'],
     )
-    assert.equal((await report({ usage: { limits: [] } })).body.error, null)
+    assert.notEqual(failed.body.reportedAt, reported.body.reportedAt)
+    const read = await report({ usage: { limits: [] } })
+    assert.deepEqual([read.body.limits, read.body.limitsAt, read.body.error], [[], read.body.reportedAt, null])
 
     assert.equal((await report({ usage: 'nope' })).status, 400)
   })
@@ -154,13 +158,28 @@ describe('the usage reserve', () => {
     await report([])
   })
 
-  test("doesn't hold agents back on a stale report, or past a limit's reset", () => {
-    const reportedAt = new Date().toISOString()
+  test('keeps holding agents back when the supervisor fails to read the usage', async () => {
+    await addTicket({ title: 'Waiting' })
+    await setReserve({ week: 80 })
+    const read = await report([{ kind: 'weekly_all', percent: 90, resets_at: nextWeek }])
+    const failed = await call<ClaudeUsage>('POST', '/system/claude-usage', { error: 'timed out' }, 'agent-supervisor')
+    assert.deepEqual([failed.body.limitsAt, failed.body.reserveReached], [read.body.limitsAt, read.body.reserveReached])
+    assert.ok(failed.body.reserveReached)
+    assert.equal((await claimNext()).status, 404)
+
+    await setReserve({ week: null })
+    assert.equal((await claimNext()).body.title, 'Waiting')
+    await report([])
+  })
+
+  // Stale limits fail open: a supervisor that stopped, or can't read the usage for that long, doesn't stop the agents.
+  test("doesn't hold agents back on stale limits, or past a limit's reset", () => {
+    const limitsAt = new Date().toISOString()
     const week = { label: 'Week, all models', percent: 90, resetsAt: nextWeek }
-    const reported = { reportedAt, limits: [week], reserve: { week: 80, session: null } }
+    const reported = { limitsAt, limits: [week], reserve: { week: 80, session: null } }
     assert.deepEqual(reserveReached(reported), week)
     assert.equal(reserveReached({ ...reported, reserve: { week: null, session: 80 } }), null)
-    assert.equal(reserveReached({ ...reported, reportedAt: null }), null)
+    assert.equal(reserveReached({ ...reported, limitsAt: null }), null)
     // Fresh for 30 minutes: the supervisor reports every 5, so an older report means it stopped.
     assert.deepEqual(reserveReached(reported, Date.now() + 29 * 60_000), week)
     assert.equal(reserveReached(reported, Date.now() + 31 * 60_000), null)
@@ -179,7 +198,7 @@ describe('the usage reserve', () => {
   test('names the limit that lifts last when both reserves hold agents back', () => {
     const session = { label: 'Current session', percent: 95, resetsAt: inHours(2) }
     const week = { label: 'Week, all models', percent: 85, resetsAt: nextWeek }
-    const reported = { reportedAt: new Date().toISOString(), limits: [session, week] }
+    const reported = { limitsAt: new Date().toISOString(), limits: [session, week] }
     assert.deepEqual(reserveReached({ ...reported, reserve: { week: 80, session: 90 } }), week)
     assert.deepEqual(reserveReached({ ...reported, reserve: { week: 90, session: 90 } }), session)
     // Once the session resets nothing does, the week being below its reserve.

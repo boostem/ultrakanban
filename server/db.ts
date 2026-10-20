@@ -444,6 +444,11 @@ const MIGRATIONS = [
   -- so a ticket whose content hasn't changed since isn't sent to Jev again.
   ALTER TABLE ticket_routes ADD COLUMN content_key TEXT;
   `,
+  `
+  -- When the Claude usage limits were last read (see ClaudeUsage.limitsAt): a report with only an error keeps them.
+  ALTER TABLE claude_usage ADD COLUMN limits_at TEXT;
+  UPDATE claude_usage SET limits_at = reported_at;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

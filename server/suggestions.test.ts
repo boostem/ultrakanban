@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { beforeEach, describe, test } from 'node:test'
-import type { AgentSuggestion, BoardDetail, TokenCounts } from '../shared/domain.ts'
-import { similarity, titleWords } from './store/suggestions.ts'
+import type { AgentSuggestion, BoardDetail, Overview, TokenCounts } from '../shared/domain.ts'
+import { settingReport, similarity, titleWords } from './store/suggestions.ts'
 import { addTicket, boardId, call, pullRequestStatuses, useBoard } from './test-app.ts'
 
 describe('agent suggestions', () => {
@@ -250,5 +250,55 @@ describe('agent suggestions', () => {
     const large = similarity(small, { ...small, estimate: 'L' })
     assert.ok(large < medium && medium < 1)
     assert.equal(similarity(small, { ...small, tags: new Set(['b']), words: new Set() }), 0)
+  })
+  test('reports every decided ticket by the setting that did most of its work, on the overview too', async () => {
+    await pastTicket('Fix login bug', 'done', [['claude/opus/high', 3]])
+    await pastTicket('Add CSV export', 'cancelled', [['claude/opus/high', 1]])
+    await pastTicket('Write release notes', 'done', [
+      ['claude/sonnet/medium', 0.4, 5000],
+      ['claude/opus/high', 0.6, 1000],
+    ])
+    // Another agent's work counts too, unlike in suggestions; work still in progress doesn't.
+    await pastTicket('Port the parser', 'done', [['codex/gpt-5.1-codex/medium', null, 2000]])
+    await pastTicket('Speed up board loading', 'open', [['claude/haiku/low', 0.01]])
+
+    const report = settingReport([boardId])
+    const cost = (costUsd: number | null, costPerFinishedUsd: number | null) => ({ costUsd, costPerFinishedUsd })
+    const tokens = (tokens: number, perFinished: number) => ({
+      tokens,
+      weightedTokens: tokens,
+      weightedTokensPerFinished: perFinished,
+    })
+    assert.deepEqual(report, [
+      {
+        model: 'opus',
+        effort: 'high',
+        tickets: 2,
+        finished: 1,
+        successRate: 0.5,
+        ...cost(2, 4),
+        ...tokens(1000, 2000),
+      },
+      {
+        model: 'gpt-5.1-codex',
+        effort: 'medium',
+        tickets: 1,
+        finished: 1,
+        successRate: 1,
+        ...cost(null, null),
+        ...tokens(2000, 2000),
+      },
+      {
+        model: 'sonnet',
+        effort: 'medium',
+        tickets: 1,
+        finished: 1,
+        successRate: 1,
+        ...cost(1, 1),
+        ...tokens(6000, 6000),
+      },
+    ])
+    const { body: overview } = await call<Overview>('GET', '/overview')
+    for (const setting of report) assert.ok(overview.settings.some((entry) => entry.model === setting.model))
   })
 })

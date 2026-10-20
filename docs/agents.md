@@ -219,6 +219,10 @@ resumed. Directories no run has used for 3 days are removed too. Every run's pro
 marker in their environment. When the run ends, the loop stops whatever still has the marker, such as a dev server
 started in the background, so nothing it started keeps holding memory.
 
+**Max turns.** The board's **Max turns per run** setting (`agentMaxTurns`) caps how many turns one `claude -p` run may
+take; the loop passes it as `--max-turns`. Without it a run is limited only by `TICKET_TIMEOUT`. A run that hits the cap
+ends like any other unfinished run and is retried up to `MAX_ATTEMPTS` times.
+
 **Parallel runs.** By default a board's agent runs one `claude -p` at a time. The board's **Parallel runs** setting
 (`agentConcurrency`, up to 8) lets it work that many tickets at once: the unit then runs that many loops, the first in
 the clone and each other one in its own git worktree of it (`boards/<board>/worktrees/<n>`), so their branches and
@@ -290,7 +294,9 @@ that ran and failed, merge conflicts, or someone moving the ticket back into In 
 ask for more work). The prompt lists exactly what is new, and every prompt includes the board's description (Board
 settings), so put conventions for all of the board's tickets there. Bots and the agent's own replies
 don't count: the agent posts from the same GitHub account as you, so the skill makes it end every pull request
-comment with `<!-- ultrakanban:<agent> -->`, which the loop ignores. A pull request closed without merging moves
+comment with `<!-- ultrakanban:<agent> -->`, which the loop ignores. Pull request comments and reviews posted while
+one of the agent's runs on the ticket was going don't count either, in case the agent left the marker out (so one you
+post during a run doesn't start a new one: say it on the ticket instead). A pull request closed without merging moves
 its ticket to the `Cancelled` column (`CANCELLED_COLUMN`; add it to the board, the loop won't fall back to Todo)
 and unassigns it, so it is never picked up again. When none of its tickets needs work, it claims a new Todo ticket,
 and when there is nothing to do at all it waits `IDLE_SECONDS` (60 under the supervisor), or until the board wakes it
@@ -351,7 +357,9 @@ name, so re-running CI doesn't start a run. Checks that never ran or failed arou
 `action_required`, `timed_out`, billing or spending-limit messages, jobs where no step failed) never start a run;
 the loop leaves one ticket note per commit saying CI isn't running. Cancelled, skipped and neutral checks are
 ignored. On top of that, after `MAX_CI_RUNS` (default 2) runs in a row started only by CI, it stops starting CI runs
-for the ticket, with a note, until someone comments. And the agent is told not to push anything when a failure
+for the ticket, with a note, until someone comments. Merge conflicts work the same way: a pull request that stays in
+conflict starts a run each time the base branch moves, so after `MAX_CONFLICT_RUNS` (default 2) runs in a row started
+only by conflicts, the loop stops starting them, with a note, until someone comments. And the agent is told not to push anything when a failure
 isn't from the code.
 
 A failed run saves nothing and is retried with backoff (`RETRY_SECONDS`, doubling, up to `MAX_ATTEMPTS` in a row,

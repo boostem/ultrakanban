@@ -12,8 +12,8 @@ JSON over HTTP. Base URL: `http://127.0.0.1:4317/api` (in development the Vite d
   - `404 usage_reserve_reached` - `claim-next` hands out no new tickets while the week's or the current session's
     Claude usage is at its usage reserve (see [Claude usage](#claude-usage)); `details` has the `limit` and its
     `reservePercent`. Try again later.
-  - `409 already_claimed` / `claimed_by_other` - someone else holds the ticket (`details.ticket` has its current state).
-  - `409 version_conflict` - `ifVersion` did not match (`details.ticket` has its current state).
+  - `409 already_claimed` / `claimed_by_other` - someone else holds the ticket (`details` has its current `version`, `assignee` and `columnId`).
+  - `409 version_conflict` - `ifVersion` did not match (`details` has its current `version`, `assignee` and `columnId`).
   - `409 tag_exists` - tag names are unique per board (case-insensitive).
   - `409 pull_request_not_merged` - the board's done column only accepts tickets whose pull request is merged.
   - `409 merge_in_progress` - the board's pull requests are already being merged.

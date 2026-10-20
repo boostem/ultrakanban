@@ -32,6 +32,12 @@ export type BoardPatch = Partial<
     | 'archiveDoneDays'
     | 'approvalSize'
     | 'notifyUrl'
+    | 'jevEnabled'
+    | 'jevModels'
+    | 'jevThreshold'
+    | 'jevOnlyLower'
+    | 'jevCombine'
+    | 'jevMode'
   >
 >
 export type TicketPatch = Partial<

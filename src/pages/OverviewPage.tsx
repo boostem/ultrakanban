@@ -18,6 +18,7 @@ import { ClaudeUsage } from '@/components/overview/ClaudeUsage'
 import { type ChartSeries, ColumnChart } from '@/components/overview/ColumnChart'
 import { NeedsAttention } from '@/components/overview/NeedsAttention'
 import { RecentActivity } from '@/components/overview/RecentActivity'
+import { RoutingTable } from '@/components/overview/RoutingTable'
 import { TicketUsageTable, type UsageGrouping } from '@/components/overview/TicketUsageTable'
 import { Button } from '@/components/ui/button'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -64,6 +65,7 @@ const SECTIONS = {
   agents: 'agents',
   boards: 'boards',
   ticketUsage: 'ticket-usage',
+  routing: 'routing',
   activity: 'activity',
   timeWorked: 'time-worked',
   tokens: 'tokens',
@@ -137,6 +139,7 @@ function JumpBar({ attention }: { attention: number }) {
     [SECTIONS.agents, 'Agents'],
     [SECTIONS.boards, 'Boards'],
     [SECTIONS.ticketUsage, 'Ticket usage'],
+    [SECTIONS.routing, 'Routing'],
     [SECTIONS.recent, 'Recent activity'],
   ]
   return (
@@ -469,6 +472,13 @@ export function OverviewPage() {
                 Tickets agents ran on in the last {days} days, with all their runs
               </p>
               <TicketUsageTable tickets={overview.tickets} grouping={usageGrouping} />
+            </Section>
+            <Section id={SECTIONS.routing} title="Routing">
+              <p className="-mt-1 text-xs text-muted-foreground">
+                Cost per finished ticket had each source picked every ticket’s model and effort, on all boards since
+                routing was recorded
+              </p>
+              <RoutingTable routing={overview.routing} />
             </Section>
           </div>
           {/* On wide screens Recent activity takes what's left of the height of the Agents and Boards column

@@ -479,6 +479,11 @@ export const MIGRATIONS = [
   DROP TABLE token_usage_models_kept;
   `,
   `
+  -- For the overview's queries over recent activity, by time and by actor (see overview.ts).
+  CREATE INDEX activity_created_at ON activity(created_at);
+  CREATE INDEX activity_actor ON activity(actor, id);
+  `,
+  `
   -- When the Claude usage limits were last read (see ClaudeUsage.limitsAt): a report with only an error keeps them.
   ALTER TABLE claude_usage ADD COLUMN limits_at TEXT;
   UPDATE claude_usage SET limits_at = reported_at;

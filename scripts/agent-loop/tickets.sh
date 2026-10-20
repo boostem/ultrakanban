@@ -43,6 +43,21 @@ worked on again."
   log "ticket #$number ($id): moved back to $column; released it"
 }
 
+# Sets the worker for a run on feedback: the ticket's own model and effort (- when it has none), else the setting the
+# board routed it to when it routes with Jev (kept from the claim, so Jev isn't asked again while the ticket doesn't
+# change), else MODEL and EFFORT.
+use_ticket_worker() {
+  local id=$1 model=${2#-} effort=${3#-} routed
+  if [[ -z $model && -z $effort ]]; then
+    routed=$(get "/tickets/$id/route" | jq -r '.routed // empty | "\(.model)\t\(.effort)"') || routed=
+    if [[ -n $routed ]]; then
+      model=${routed%%$'\t'*}
+      effort=${routed#*$'\t'}
+    fi
+  fi
+  use_worker "$model" "$effort"
+}
+
 # Reassigns a ticket held under another of the agent's names (another model or effort, or the bare agent name) to
 # the worker set by use_worker, in one versioned update.
 adopt() {
@@ -139,7 +154,7 @@ handle_feedback() {
     triage=$(printf '%s\n' "$activity" "$pr" "$ci" "$issue" "$reviews" "$inline" "$state" |
       jq -cs --arg agent "$AGENT" --arg loop "$LOOP_ACTOR" --arg marker "$MARKER" --arg working "$IN_PROGRESS_COLUMN" \
         --argjson now "$(date +%s)" --argjson retry "$RETRY_SECONDS" --argjson max "$MAX_ATTEMPTS" \
-        --argjson maxci "$MAX_CI_RUNS" "$TRIAGE") ||
+        --argjson maxci "$MAX_CI_RUNS" --argjson maxconflict "$MAX_CONFLICT_RUNS" "$TRIAGE") ||
       { log "can't triage $id"; continue; }
     activity= pr= ci= issue= reviews= inline=
 
@@ -156,10 +171,16 @@ handle_feedback() {
 loop stopped starting runs for CI on this ticket. Comment on the ticket to let it try again." notify
       update_state "$id" '.capNoted = true'
     fi
+    if [[ $(jq -r .conflictCapNote <<<"$triage") == true ]]; then
+      log "ticket #$number ($id): $MAX_CONFLICT_RUNS runs in a row for merge conflicts; not starting more until a human comments"
+      note "$id" "The agent made $MAX_CONFLICT_RUNS runs in a row for merge conflicts with no human feedback in between, \
+so the loop stopped starting runs for conflicts on this ticket. Comment on the ticket to let it try again." notify
+      update_state "$id" '.conflictCapNoted = true'
+    fi
     [[ $(jq -r .run <<<"$triage") == true ]] || continue
     [[ $CONFLICTS_ONLY == 1 && $(jq -r .conflicted <<<"$triage") != true ]] && continue
 
-    use_worker "${ticket_model#-}" "${ticket_effort#-}"
+    use_ticket_worker "$id" "$ticket_model" "$ticket_effort"
     adopt "$id" "$number" "$holder" "$version" || continue
     items=$(jq -r '.items | map(.text) | join("\n\n---\n\n")' <<<"$triage")
     run_step=$(jq -r '.items | map(.text | split("\n")[0] | rtrimstr(":")) | join("; ")' <<<"$triage")
@@ -178,8 +199,7 @@ Ticket $id is already yours. The loop started this run for this new feedback:
 
 $items
 
-Read the ticket's activity and, if it has a pull request, its comments, reviews, inline review comments and checks,
-then address everything above: answer questions, make the requested changes, fix failing checks, and resolve merge
+The new feedback is above; fetch more only if you need context. Address everything above: answer questions, make the requested changes, fix failing checks, and resolve merge
 conflicts by merging the base branch into the pull request's branch. Commit and push to that branch.
 Reply where each piece of feedback was given: on the pull request for pull request feedback (with the marker line).
 $next$(
@@ -276,13 +296,28 @@ their first run yet (CLAIM_LIMIT $CLAIM_LIMIT)"
     log "ticket #$(jq -r .number <<<"$ticket") ($id): another loop is already working it"
     return 0
   fi
-  # The claim can't know the ticket's model and effort beforehand, so a ticket that sets them is handed to that worker
-  # now.
-  use_worker "$(jq -r '.agentModel // ""' <<<"$ticket")" "$(jq -r '.agentEffort // ""' <<<"$ticket")"
+  # The claim can't know the ticket's model and effort beforehand, so a ticket that sets them, or that the board routed
+  # (its routed setting, on a board that routes with Jev), is handed to that worker now.
+  use_worker "$(jq -r '.routed.model // .agentModel // ""' <<<"$ticket")" \
+    "$(jq -r '.routed.effort // .agentEffort // ""' <<<"$ticket")"
   adopt "$id" "$(jq -r .number <<<"$ticket")" "$WORKER" "$(jq -r .version <<<"$ticket")" || use_worker "" ""
   # Everything on the ticket so far is handed to this run. Until it succeeds, the claim itself counts as feedback,
   # so a failed or interrupted run is retried with backoff.
   snapshot=$(get "/tickets/$id/activity" | jq -c '{activity: (map(.id) | max // 0)}') || snapshot='{}'
+  # A re-claimed ticket may already have a pull request: its comments and reviews so far were handed over before, so
+  # they go into the snapshot too, or they would come back as new feedback.
+  local pr_repo pr_number issue reviews inline
+  pr_repo=$(jq -r '.pullRequest.repo // empty' <<<"$ticket")
+  pr_number=$(jq -r '.pullRequest.number // empty' <<<"$ticket")
+  if [[ -n $pr_repo && -n $pr_number ]]; then
+    if issue=$(gh_list "repos/$pr_repo/issues/$pr_number/comments?per_page=100") &&
+      reviews=$(gh_list "repos/$pr_repo/pulls/$pr_number/reviews?per_page=100") &&
+      inline=$(gh_list "repos/$pr_repo/pulls/$pr_number/comments?per_page=100"); then
+      snapshot=$(jq -c --argjson i "$issue" --argjson r "$reviews" --argjson c "$inline" \
+        '. + {issue: ([$i[].id] | max // 0), review: ([$r[].id] | max // 0), inline: ([$c[].id] | max // 0)}' \
+        <<<"$snapshot") || true
+    fi
+  fi
   write_state "$id" "$(jq -c '. + {claim: true}' <<<"$snapshot")"
   claim_unlock
   run_step="Working the ticket"

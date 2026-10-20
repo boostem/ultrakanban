@@ -301,6 +301,7 @@ export const releaseTicketSchema = z.object({
 
 export const heartbeatSchema = z.object({
   step: z.string().trim().max(200).optional(),
+  tokens: z.int().min(0).optional(),
 })
 
 export const releaseIdleSchema = z.object({
@@ -450,6 +451,7 @@ export const recordRunSchema = z
     exitCode: z.int().nullable().default(null),
     durationMs: tokens.nullable().default(null),
     turns: tokens.nullable().default(null),
+    tokens: tokens.nullable().default(null),
     costUsd: cost,
     message: clipped(RUN_MESSAGE_MAX).default(''),
     steps: z

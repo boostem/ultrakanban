@@ -444,6 +444,11 @@ const MIGRATIONS = [
   -- so a ticket whose content hasn't changed since isn't sent to Jev again.
   ALTER TABLE ticket_routes ADD COLUMN content_key TEXT;
   `,
+  `
+  -- Tokens the run working the ticket has used so far, as its heartbeats say, and those a run record's run used.
+  ALTER TABLE tickets ADD COLUMN run_tokens INTEGER;
+  ALTER TABLE run_records ADD COLUMN tokens INTEGER;
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

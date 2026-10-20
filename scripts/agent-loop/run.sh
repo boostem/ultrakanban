@@ -402,6 +402,9 @@ run_claude() {
 Put scratch files (clones, builds, test output, screenshots) in \$TMPDIR ($scratch), not in /tmp: /tmp may be held \
 in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it once the ticket's run finishes."
   fi
+  # The board's agentMaxTurns, when set, caps how many turns the run may take.
+  max_turns=$(get "/boards/$BOARD" | jq -r '.board.agentMaxTurns // empty' 2>/dev/null)
+  [[ $max_turns =~ ^[0-9]+$ ]] || max_turns=
   run=$(new_session_id)
   started=$(date +%s%3N)
   (
@@ -410,8 +413,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
     # The marker stop_leftovers looks for, inherited by everything the run starts.
     export ULTRAKANBAN_RUN=$run
     if [[ -n $scratch ]]; then export TMPDIR=$scratch; fi
-    exec timeout --foreground "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
-      ${skill_args[@]+"${skill_args[@]}"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
+    exec timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
+      ${skill_args[@]+"${skill_args[@]}"} ${max_turns:+--max-turns "$max_turns"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
   ) <<<"$prompt" >"$output" 2>"$errors" &
   running=$!
   inhibit_sleep "$id" "$running"
@@ -419,6 +422,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   watcher=$!
   wait "$running"
   code=$?
+  # A signal for the loop interrupts wait while the run is still stopping (see the INT/TERM trap).
+  while kill -0 "$running" 2>/dev/null; do wait "$running"; code=$?; done
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   end_run "$id"
@@ -448,6 +453,7 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   fi
   record_run "$id" "$code" "$summary" "$usage" "$(($(date +%s%3N) - started))"
   rm -f "$output" "$errors" "$stopped"
+  if [[ -n $stopping ]]; then exit 0; fi
   return "$code"
 }
 
@@ -502,8 +508,8 @@ from origin with no local changes."
     elif [[ -n $branch ]]; then
       notes="
 
-The repository is checked out on $branch, freshly updated from origin$(
-        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' " with no local changes")."
+The repository is checked out on $branch$(
+        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' ", freshly updated from origin with no local changes")."
     fi
     while :; do
       if [[ -n $session ]]; then
@@ -518,11 +524,14 @@ $task$notes"
 
 $task$( ((steps)) && unchecked_steps "$id")$notes"
       fi
-      update_state "$id" '.session = ($v | fromjson) | del(.stopped)' \
+      update_state "$id" '.session = ($v | fromjson) | del(.stopped) | .runStart = (now | floor)' \
         "$(jq -nc --arg id "$session" --arg checkout "$PWD" --arg worker "$worker" \
           '{id: $id, checkout: $checkout, worker: $worker}')"
       run_claude "$id" "$prompt" "$start" "$session"
       code=$?
+      # When the run started and ended, so that TRIAGE doesn't take the pull request comments it posted (without the
+      # marker) for feedback. The last 20 runs are kept.
+      update_state "$id" '.runs = ((.runs // []) + [[.runStart // (now | floor), (now | ceil)]])[-20:] | del(.runStart)'
       # The session is gone (e.g. claude's history was cleared): run again at once as a new session, with the whole
       # prompt. A session from another checkout isn't: claude --resume finds a session id in any project directory,
       # and the resumed run works in this one (checked with Claude Code 2.1.304).
@@ -541,9 +550,11 @@ $task$( ((steps)) && unchecked_steps "$id")$notes"
     log "can't update the checkout for $id"
   fi
   if [[ $code == 0 ]]; then
-    # The snapshot replaces the state, but the session stays for the next run to resume.
+    # The snapshot replaces the state, but the session stays for the next run to resume, and the run times stay for
+    # TRIAGE.
     write_state "$id" "$(read_state "$id" | jq -c --argjson snapshot "$snapshot" \
-      '$snapshot + if .session then {session: (.session | del(.why) + {done: true})} else {} end')"
+      '$snapshot + (. | {runs} | with_entries(select(.value != null))) +
+        if .session then {session: (.session | del(.why) + {done: true})} else {} end')"
     remove_scratch "$id"
     return 0
   fi

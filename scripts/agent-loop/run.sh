@@ -402,6 +402,9 @@ run_claude() {
 Put scratch files (clones, builds, test output, screenshots) in \$TMPDIR ($scratch), not in /tmp: /tmp may be held \
 in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it once the ticket's run finishes."
   fi
+  # The board's agentMaxTurns, when set, caps how many turns the run may take.
+  max_turns=$(get "/boards/$BOARD" | jq -r '.board.agentMaxTurns // empty' 2>/dev/null)
+  [[ $max_turns =~ ^[0-9]+$ ]] || max_turns=
   run=$(new_session_id)
   started=$(date +%s%3N)
   (
@@ -411,7 +414,7 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
     export ULTRAKANBAN_RUN=$run
     if [[ -n $scratch ]]; then export TMPDIR=$scratch; fi
     exec timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
-      ${skill_args[@]+"${skill_args[@]}"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
+      ${skill_args[@]+"${skill_args[@]}"} ${max_turns:+--max-turns "$max_turns"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
   ) <<<"$prompt" >"$output" 2>"$errors" &
   running=$!
   inhibit_sleep "$id" "$running"

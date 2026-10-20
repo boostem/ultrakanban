@@ -246,6 +246,7 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
     }
     const text = (field: string) => String(data.get(field) ?? '').trim() || null
     const archiveDays = Number(text('archiveDoneDays'))
+    const maxTurns = Number(text('agentMaxTurns'))
     const approvalSize = String(data.get('approvalSize') ?? NONE)
     // Left alone without a key, as the settings aren't shown then.
     const jevPatch: BoardPatch = hasTypesafeKey ? jev : {}
@@ -260,6 +261,7 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
       agentModel: text('agentModel'),
       agentEffort: agent.agentEffort,
       agentConcurrency,
+      agentMaxTurns: maxTurns >= 1 ? Math.round(maxTurns) : null,
       agentConflictConcurrency,
       agentEnabled: data.get('agentEnabled') === 'on',
       agentBacklog: data.get('agentBacklog') === 'on',
@@ -467,6 +469,19 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
                 ))}
               </SelectContent>
             </Select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="board-settings-agent-max-turns">Max turns per run</Label>
+            <Input
+              id="board-settings-agent-max-turns"
+              name="agentMaxTurns"
+              type="number"
+              min={1}
+              max={10000}
+              step={1}
+              defaultValue={detail.board.agentMaxTurns ?? ''}
+              placeholder="no limit"
+            />
           </div>
           <div className="grid gap-2">
             <Label htmlFor="board-settings-agent-conflict-concurrency">Parallel conflict fixes</Label>

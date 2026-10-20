@@ -478,6 +478,11 @@ export const MIGRATIONS = [
   INSERT INTO token_usage_models SELECT * FROM token_usage_models_kept;
   DROP TABLE token_usage_models_kept;
   `,
+  `
+  -- For the overview's queries over recent activity, by time and by actor (see overview.ts).
+  CREATE INDEX activity_created_at ON activity(created_at);
+  CREATE INDEX activity_actor ON activity(actor, id);
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

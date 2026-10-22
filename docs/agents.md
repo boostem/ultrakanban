@@ -162,7 +162,11 @@ are logged out, also run `loginctl enable-linger`.
 **Claude usage.** The supervisor also reads how much of your Claude plan's usage limits is used (the current session,
 the week, and any per-model weekly limit, as `/usage` in claude shows them) every 5 minutes (`CLAUDE_USAGE_SECONDS`),
 with the claude login in `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), and the overview shows it as bars of
-the usage left and when each resets. The board itself can't read it: it runs in a container, without your login.
+the usage left and when each resets. Next to them it shows the credits the account can spend on usage besides its
+limits, in dollars: a **credit grant** (dollars granted to the plan), and **usage credits** (what claude.ai calls extra
+usage: they cover you once a limit is reached, while switched on), or that they are off. Neither is API credits: those
+are a Claude Console balance that API keys spend, and the claude login can't read it. The board itself can't read any
+of it: it runs in a container, without your login.
 
 **Usage reserve.** Agents share your Claude plan with you, and left alone they can use up the whole week, or the
 current session just when you want to work. Set the **Usage reserve** under the Claude usage on the overview (one
@@ -171,7 +175,9 @@ and 90% of the session: once a weekly limit (all models, or a per-model one such
 reaches its reserve, `claim-next` hands out no new tickets, so every loop on every board stops claiming without any
 change to it. The loop logs it once (`not claiming new tickets: ...`, and again when it lifts) and idles; the overview
 marks each reserve on its bars and says when agents paused new tickets. A session reserve lifts when the session
-resets, within five hours. Tickets the agents already hold still get runs for their feedback, on purpose: a pull
+resets, within five hours. **Usage credits**, next to the reserve, says whether agents may run on your usage credits:
+by default (**Keep for me**) a limit that is used up stops claiming like a reserve at 100%; **Agents may spend them**
+lets them go on claiming, with Claude spending usage credits once a limit is reached, when they are on. Tickets the agents already hold still get runs for their feedback, on purpose: a pull
 request in review whose reviewer asks for a change shouldn't wait a week, and those runs are usually small. When the
 session or the week does run out, Claude's own limit stops them (see below). The reserve only goes by a report from
 the last 30 minutes: when the supervisor stops reporting, agents claim as usual rather than stop with it.
@@ -370,7 +376,10 @@ isn't from the code.
 A failed run saves nothing and is retried with backoff (`RETRY_SECONDS`, doubling, up to `MAX_ATTEMPTS` in a row,
 then again when new feedback arrives), with a ticket note saying why it failed. Running out of Claude usage doesn't
 count as a failure: the note quotes claude's limit message, and the loop starts no runs on any ticket until the time
-the message says the limit resets.
+the message says the limit resets, or until the Claude usage the supervisor reports to the board shows none of its
+limits used up, if that is sooner (as when you reset your usage on claude.ai or buy more): while paused, the loop reads
+the board's report every `USAGE_CHECK_SECONDS` (default 60), and the supervisor reads the usage every
+`CLAUDE_USAGE_SECONDS` (default 300), so it picks back up within a few minutes.
 
 Runs that don't finish pick up where they left off. Each run is a `claude` session whose id the loop keeps with the
 ticket until the run ends. When a run is cut short by the usage limit, or by the loop stopping (restarting the service,

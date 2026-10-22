@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import type { ApiErrorBody, ClaudeUsage, Ticket } from '../shared/domain.ts'
-import { parseClaudeUsage, reserveReached } from './store/claude-usage.ts'
+import { parseClaudeCredits, parseClaudeUsage, reserveReached } from './store/claude-usage.ts'
 import { addTicket, boardId, call } from './test-app.ts'
 
 describe('Claude usage', () => {
@@ -15,15 +15,23 @@ describe('Claude usage', () => {
       limitsAt: null,
       plan: null,
       limits: [],
+      credits: [],
       error: null,
-      reserve: { week: null, session: null },
+      reserve: { week: null, session: null, usageCredits: false },
       reserveReached: null,
     })
 
     const reported = await report({
       plan: 'max',
       usage: {
-        five_hour: { utilization: 3, resets_at: '2026-10-05T23:00:00+00:00' },
+        five_hour: { utilization: 3, resets_at: '2026-10-05T23:00:00+00:00', limit_dollars: null },
+        monthly_grant: {
+          utilization: 10,
+          resets_at: '2026-11-05T07:59:00+00:00',
+          limit_dollars: 250,
+          used_dollars: 25,
+          remaining_dollars: 225,
+        },
         limits: [
           { kind: 'session', percent: 3, resets_at: '2026-10-05T23:00:00+00:00' },
           { kind: 'weekly_all', percent: 46, resets_at: '2026-10-08T01:00:00+00:00' },
@@ -42,12 +50,26 @@ describe('Claude usage', () => {
       { label: 'Week, Opus', percent: 0, resetsAt: null },
     ])
 
-    // Without usage it keeps the limits and when they were read, with an error too: one failed read doesn't clear them.
-    assert.equal((await report({})).body.limits.length, 3)
+    assert.deepEqual(reported.body.credits, [
+      {
+        kind: 'grant',
+        label: 'Credit grant',
+        enabled: true,
+        currency: 'USD',
+        used: 25,
+        limit: 250,
+        remaining: 225,
+        resetsAt: '2026-11-05T07:59:00+00:00',
+      },
+    ])
+
+    // Without usage it keeps what it had, with an error too: one failed read doesn't clear it.
+    const kept = (await report({})).body
+    assert.deepEqual([kept.limits.length, kept.credits.length], [3, 1])
     const failed = await report({ error: 'No claude login on the host' })
     assert.deepEqual(
-      [failed.body.limits, failed.body.limitsAt, failed.body.error, failed.body.plan],
-      [reported.body.limits, reported.body.limitsAt, 'No claude login on the host', 'max'],
+      [failed.body.limits, failed.body.credits, failed.body.limitsAt, failed.body.error, failed.body.plan],
+      [reported.body.limits, reported.body.credits, reported.body.limitsAt, 'No claude login on the host', 'max'],
     )
     assert.notEqual(failed.body.reportedAt, reported.body.reportedAt)
     const read = await report({ usage: { limits: [] } })
@@ -71,6 +93,72 @@ describe('Claude usage', () => {
   })
 })
 
+describe('Claude usage credits', () => {
+  const spend = (fields: Record<string, unknown>) => ({
+    spend: { enabled: true, used: { amount_minor: 1250, currency: 'USD', exponent: 2 }, limit: null, ...fields },
+  })
+  const usageCredits = { kind: 'usage', label: 'Usage credits', enabled: true, currency: 'USD', resetsAt: null }
+
+  test('picks out credit grants and leaves out what is not one', () => {
+    assert.deepEqual(
+      parseClaudeCredits({
+        five_hour: { utilization: 74, limit_dollars: null, used_dollars: null, remaining_dollars: null },
+        grant: { resets_at: 'soon', limit_dollars: 100, remaining_dollars: 40 },
+        broken: { limit_dollars: -5 },
+        limits: [{ kind: 'session', percent: 3 }],
+      }),
+      [
+        {
+          kind: 'grant',
+          label: 'Credit grant',
+          enabled: true,
+          currency: 'USD',
+          used: 60,
+          limit: 100,
+          remaining: 40,
+          resetsAt: null,
+        },
+      ],
+    )
+  })
+
+  test('tells usage credits apart from grants, and says when they are off', () => {
+    const grant = { limit_dollars: 250, used_dollars: 0, remaining_dollars: 250, resets_at: '2026-11-05T07:59:00Z' }
+    assert.deepEqual(
+      parseClaudeCredits({
+        iguana_necktie: grant,
+        extra_usage: { is_enabled: false, monthly_limit: null, used_credits: null },
+        spend: { enabled: false, used: { amount_minor: 0, currency: 'USD', exponent: 2 }, limit: null, balance: null },
+      }).map(({ kind, label, enabled, used }) => ({ kind, label, enabled, used })),
+      [
+        { kind: 'grant', label: 'Credit grant', enabled: true, used: 0 },
+        { kind: 'usage', label: 'Usage credits', enabled: false, used: 0 },
+      ],
+    )
+    assert.deepEqual(parseClaudeCredits({ extra_usage: { is_enabled: false } }), [
+      { ...usageCredits, enabled: false, used: 0, limit: null, remaining: null },
+    ])
+  })
+
+  test('reads what usage credits have spent and have left', () => {
+    const credits = { ...usageCredits, used: 12.5 }
+    assert.deepEqual(parseClaudeCredits(spend({})), [{ ...credits, limit: null, remaining: null }])
+    assert.deepEqual(parseClaudeCredits(spend({ limit: { amount_minor: 5000, currency: 'USD', exponent: 2 } })), [
+      { ...credits, limit: 50, remaining: 37.5 },
+    ])
+    assert.deepEqual(parseClaudeCredits(spend({ balance: { amount_minor: 800, currency: 'USD', exponent: 2 } })), [
+      { ...credits, limit: null, remaining: 8 },
+    ])
+    // The older fields, in cents, only without `spend`.
+    assert.deepEqual(
+      parseClaudeCredits({
+        extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1250, currency: 'EUR' },
+      }),
+      [{ ...credits, currency: 'EUR', limit: 50, remaining: 37.5 }],
+    )
+  })
+})
+
 describe('the usage reserve', () => {
   const usage = async () => (await call<ClaudeUsage>('GET', '/system/claude-usage')).body
   const setReserve = (reserve: Record<string, unknown>) =>
@@ -83,7 +171,7 @@ describe('the usage reserve', () => {
   const nextWeek = inHours(3 * 24)
 
   test('is a percent of the week and of the current session, each or off', async () => {
-    assert.deepEqual((await usage()).reserve, { week: null, session: null })
+    assert.deepEqual((await usage()).reserve, { week: null, session: null, usageCredits: false })
     for (const value of [0, 101, 50.5, '80']) {
       assert.equal((await setReserve({ week: value })).status, 400, String(value))
       assert.equal((await setReserve({ session: value })).status, 400, String(value))
@@ -91,12 +179,16 @@ describe('the usage reserve', () => {
     assert.equal((await setReserve({})).status, 400)
     const set = await setReserve({ week: 80 })
     assert.equal(set.status, 200)
-    assert.deepEqual(set.body.reserve, { week: 80, session: null })
+    assert.deepEqual(set.body.reserve, { week: 80, session: null, usageCredits: false })
     // Setting one leaves the other as it is.
-    assert.deepEqual((await setReserve({ session: 90 })).body.reserve, { week: 80, session: 90 })
-    assert.deepEqual((await usage()).reserve, { week: 80, session: 90 })
-    assert.deepEqual((await setReserve({ week: null })).body.reserve, { week: null, session: 90 })
-    assert.deepEqual((await setReserve({ week: null, session: null })).body.reserve, { week: null, session: null })
+    assert.deepEqual((await setReserve({ session: 90 })).body.reserve, { week: 80, session: 90, usageCredits: false })
+    assert.deepEqual((await usage()).reserve, { week: 80, session: 90, usageCredits: false })
+    assert.deepEqual((await setReserve({ week: null })).body.reserve, { week: null, session: 90, usageCredits: false })
+    assert.deepEqual((await setReserve({ week: null, session: null })).body.reserve, {
+      week: null,
+      session: null,
+      usageCredits: false,
+    })
   })
 
   test('stops claim-next once the week is used to it, leaving tickets agents hold alone', async () => {
@@ -178,13 +270,49 @@ describe('the usage reserve', () => {
     await report([])
   })
 
-  // Stale limits fail open: a supervisor that stopped, or can't read the usage for that long, doesn't stop the agents.
+  test('stops claim-next once a limit is used up, unless agents may spend usage credits', async () => {
+    await addTicket({ title: 'On credits' })
+    assert.equal((await setReserve({ usageCredits: 'yes' })).status, 400)
+    await report([
+      { kind: 'session', percent: 100, resets_at: inHours(2) },
+      { kind: 'weekly_all', percent: 40, resets_at: nextWeek },
+    ])
+    // With no reserve set, a used-up limit still holds agents back, so they don't run on the usage credits.
+    const reached = await usage()
+    assert.deepEqual(reached.reserveReached, { label: 'Current session', percent: 100, resetsAt: inHours(2) })
+    const refused = await claimNext()
+    assert.equal(refused.status, 429)
+    assert.equal(refused.body.error.code, 'usage_reserve_reached')
+    assert.match(
+      refused.body.error.message,
+      /Current session is used up, rather than spend the account's usage credits/,
+    )
+    assert.deepEqual(refused.body.error.details, { limit: reached.reserveReached, reservePercent: null })
+
+    // Allowing them leaves the reserves as they are, and lets agents claim.
+    const allowed = await setReserve({ usageCredits: true })
+    assert.deepEqual(allowed.body.reserve, { week: null, session: null, usageCredits: true })
+    assert.equal(allowed.body.reserveReached, null)
+    assert.equal((await claimNext()).body.title, 'On credits')
+    // A reserve still holds them back when they may spend usage credits.
+    assert.deepEqual((await setReserve({ session: 90 })).body.reserveReached?.label, 'Current session')
+    await setReserve({ session: null, usageCredits: false })
+    await report([])
+  })
+
   test("doesn't hold agents back on stale limits, or past a limit's reset", () => {
     const limitsAt = new Date().toISOString()
     const week = { label: 'Week, all models', percent: 90, resetsAt: nextWeek }
-    const reported = { limitsAt, limits: [week], reserve: { week: 80, session: null } }
+    const reported = { limitsAt, limits: [week], reserve: { week: 80, session: null, usageCredits: false } }
     assert.deepEqual(reserveReached(reported), week)
-    assert.equal(reserveReached({ ...reported, reserve: { week: null, session: 80 } }), null)
+    assert.equal(reserveReached({ ...reported, reserve: { week: null, session: 80, usageCredits: false } }), null)
+    // Used up, it holds them back without a reserve, unless they may spend usage credits.
+    const usedUp = { ...reported, limits: [{ ...week, percent: 100 }] }
+    assert.equal(reserveReached({ ...usedUp, reserve: { week: null, session: null, usageCredits: true } }), null)
+    assert.deepEqual(reserveReached({ ...usedUp, reserve: { week: null, session: null, usageCredits: false } }), {
+      ...week,
+      percent: 100,
+    })
     assert.equal(reserveReached({ ...reported, limitsAt: null }), null)
     // Fresh for 30 minutes: the supervisor reports every 5, so an older report means it stopped.
     assert.deepEqual(reserveReached(reported, Date.now() + 29 * 60_000), week)
@@ -205,9 +333,15 @@ describe('the usage reserve', () => {
     const session = { label: 'Current session', percent: 95, resetsAt: inHours(2) }
     const week = { label: 'Week, all models', percent: 85, resetsAt: nextWeek }
     const reported = { limitsAt: new Date().toISOString(), limits: [session, week] }
-    assert.deepEqual(reserveReached({ ...reported, reserve: { week: 80, session: 90 } }), week)
-    assert.deepEqual(reserveReached({ ...reported, reserve: { week: 90, session: 90 } }), session)
+    assert.deepEqual(reserveReached({ ...reported, reserve: { week: 80, session: 90, usageCredits: false } }), week)
+    assert.deepEqual(reserveReached({ ...reported, reserve: { week: 90, session: 90, usageCredits: false } }), session)
     // Once the session resets nothing does, the week being below its reserve.
-    assert.equal(reserveReached({ ...reported, reserve: { week: 90, session: 90 } }, Date.now() + 3 * 3_600_000), null)
+    assert.equal(
+      reserveReached(
+        { ...reported, reserve: { week: 90, session: 90, usageCredits: false } },
+        Date.now() + 3 * 3_600_000,
+      ),
+      null,
+    )
   })
 })

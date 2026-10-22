@@ -492,6 +492,20 @@ export const MIGRATIONS = [
   ALTER TABLE claude_usage ADD COLUMN limits_at TEXT;
   UPDATE claude_usage SET limits_at = reported_at;
   `,
+  `
+  -- Whether auto-merge goes ahead when the only failing checks failed because of billing (see BoardSummary).
+  ALTER TABLE boards ADD COLUMN ignore_billing_failures INTEGER NOT NULL DEFAULT 0;
+  `,
+  `
+  -- The credits the Claude account can spend on usage besides its plan's limits (see ClaudeUsageCredit), as JSON.
+  ALTER TABLE claude_usage ADD COLUMN credits TEXT NOT NULL DEFAULT '[]';
+  `,
+  `
+  -- Whether agents go on claiming once a Claude usage limit is used up, on usage credits (see ClaudeUsageReserve).
+  ALTER TABLE claude_usage ADD COLUMN usage_credits INTEGER NOT NULL DEFAULT 0;
+  -- Credits now say their kind; the supervisor's next report fills them in again.
+  UPDATE claude_usage SET credits = '[]';
+  `,
 ]
 
 export const databasePath = process.env.ULTRAKANBAN_DB ?? 'data/ultrakanban.db'

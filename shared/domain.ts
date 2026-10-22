@@ -186,6 +186,17 @@ export const FAILING_CHECK_EXCERPTS = 3
 export const FAILING_CHECK_EXCERPT_MAX = 600
 
 /**
+ * What a check's excerpt says when CI didn't run because of the account's billing (failed payments, a spending limit,
+ * used-up minutes), not because the code failed. The billing part of the agent loop's `INFRA_PATTERN`.
+ */
+const BILLING_FAILURE =
+  /billing|spending limit|payments have failed|account is locked|account has been locked|minutes quota|exceeded .*(minutes|quota)/i
+
+/** Whether a failing check failed because of billing (see `BILLING_FAILURE`); false when it has no excerpt. */
+export const isBillingFailure = (check: Pick<FailingCheck, 'excerpt'>) =>
+  !!check.excerpt && BILLING_FAILURE.test(check.excerpt)
+
+/**
  * A check on the pull request's head commit that didn't pass, counted the way the agent loop counts them
  * (scripts/agent-loop/ci.sh): a check run that completed as `failure`, `timed_out`, `startup_failure` or
  * `action_required`, or a commit status in `failure` or `error`. Cancelled, skipped, neutral and stale ones aren't.
@@ -200,7 +211,8 @@ export interface FailingCheck {
   /**
    * A short excerpt of why it failed, from the check run's failure annotations or its output's title and summary, at
    * most `FAILING_CHECK_EXCERPT_MAX` characters. Only the first `FAILING_CHECK_EXCERPTS` failing check runs have one
-   * (to spare GitHub's rate limit), and commit statuses give their description. Null when there is none.
+   * (to spare GitHub's rate limit), or all of them while each one's says it failed for billing (see
+   * `isBillingFailure`), and commit statuses give their description. Null when there is none.
    */
   excerpt: string | null
 }
@@ -375,6 +387,12 @@ export interface BoardSummary {
    * no conflicts, every check passed and every checklist item of the ticket checked.
    */
   autoMerge: boolean
+  /**
+   * Whether auto-merge (and the ready-to-merge notification) goes ahead when the only failing checks failed because of
+   * billing (see `isBillingFailure`), e.g. GitHub Actions jobs that weren't started for a spending limit. Pending checks
+   * and any other failing check still hold a pull request back.
+   */
+  ignoreBillingFailures: boolean
   /**
    * Whether the server deletes a pull request's branch on GitHub once the pull request is merged, after moving the open
    * pull requests based on it to the merged one's base. Branches in forks, the default branch and branches that got
@@ -1220,6 +1238,32 @@ export interface ClaudeUsageLimit {
 }
 
 /**
+ * Money the Claude account can spend on usage besides the plan's limits, in `currency` units, e.g. dollars. Neither
+ * kind is API credits, the prepaid balance of a Claude Console organisation that API keys spend: the claude.ai login
+ * the board reads usage with can't see that one.
+ */
+export interface ClaudeUsageCredit {
+  /**
+   * `grant`: dollars granted to the plan ("Credit grant"). `usage`: usage credits, what claude.ai calls extra usage,
+   * bought there and spent once a plan limit is reached, while they are switched on ("Usage credits").
+   */
+  kind: 'grant' | 'usage'
+  /** "Credit grant" or "Usage credits". */
+  label: string
+  /** Whether usage spends it now: usage credits only while switched on; a grant always. */
+  enabled: boolean
+  /** e.g. "USD". */
+  currency: string
+  used: number
+  /** How much there is in all (the grant, or extra usage's spending limit); null when it has none. */
+  limit: number | null
+  /** How much of it is left; null when unknown (extra usage without a spending limit or balance). */
+  remaining: number | null
+  /** When it resets or runs out; null when it doesn't say. */
+  resetsAt: string | null
+}
+
+/**
  * Whether a usage limit counts the week, for all models or for one (as opposed to the current session): the labels
  * the board gives them start with "Week" ("Week, all models", "Week, Opus"), or with "weekly" for kinds of limit it
  * doesn't know.
@@ -1240,6 +1284,12 @@ export interface ClaudeUsageReserve {
   week: number | null
   /** For the current session. */
   session: number | null
+  /**
+   * Whether agents go on claiming new tickets once a limit is used up, with Claude then spending the account's usage
+   * credits (see `ClaudeUsageCredit`) when they are on. False (the default) stops claiming there, keeping them for
+   * people.
+   */
+  usageCredits: boolean
 }
 
 /** The reserve that applies to a usage limit: the week's to the weekly ones, the session's to the current session. */
@@ -1269,6 +1319,8 @@ export interface ClaudeUsage {
    */
   limitsAt: string | null
   limits: ClaudeUsageLimit[]
+  /** The credits the account can spend on usage besides its limits; empty when it has none. */
+  credits: ClaudeUsageCredit[]
   /** Why the last report has no usage, e.g. no claude login on the host; the last limits stay until they go stale. */
   error: string | null
   /** How far agents may use the week and the current session (see `ClaudeUsageReserve`). */

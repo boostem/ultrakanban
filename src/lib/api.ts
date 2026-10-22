@@ -4,6 +4,7 @@ import type {
   AgentServices,
   AgentLoginKind,
   AgentSuggestion,
+  JevSuggestion,
   AppUpdate,
   ApiErrorBody,
   Attachment,
@@ -40,6 +41,7 @@ import type {
   UpdateEpicInput,
   UpdateTagInput,
   UpdateTicketInput,
+  JevSuggestionInput,
 } from '@shared/schemas'
 import { readActor } from './actor'
 
@@ -94,7 +96,10 @@ export const api = {
   moveColumn: (columnId: string, position: number) =>
     request<Column>('POST', `/columns/${columnId}/move`, { position }),
   deleteColumn: (columnId: string, moveTicketsTo?: string) =>
-    request<void>('DELETE', `/columns/${columnId}${query({ moveTicketsTo })}`),
+    request<void>(
+      'DELETE',
+      `/columns/${columnId}${query({ moveTicketsTo, deleteTickets: moveTicketsTo ? undefined : 'true' })}`,
+    ),
   idleTickets: (columnId: string) => request<Ticket[]>('GET', `/columns/${columnId}/idle-tickets`),
   releaseIdleTickets: (columnId: string, moveTo: string) =>
     request<Ticket[]>('POST', `/columns/${columnId}/release-idle`, { moveTo }),
@@ -113,6 +118,9 @@ export const api = {
     for (const tag of input.tags) search.append('tag', tag)
     return request<AgentSuggestion>('GET', `/boards/${boardId}/agent-suggestion?${search}`)
   },
+  /** Asks Jev for the model and effort of a ticket as written, with how likely each choice is. */
+  jevSuggestion: (boardId: string, input: JevSuggestionInput) =>
+    request<JevSuggestion>('POST', `/boards/${boardId}/jev-suggestion`, input),
   createTicket: (boardId: string, input: CreateTicketInput) =>
     request<Ticket>('POST', `/boards/${boardId}/tickets`, input),
   updateTicket: (ticketId: string, input: UpdateTicketInput) => request<Ticket>('PATCH', `/tickets/${ticketId}`, input),
@@ -161,6 +169,8 @@ export const api = {
   cancelAppUpdate: () => request<AppUpdate>('DELETE', '/system/update'),
   setup: () => request<SetupStatus>('GET', '/system/setup'),
   setGitHubToken: (token: string) => request<SetupStatus>('PUT', '/system/github-token', { token }),
+  setTypesafeKey: (key: string) => request<SetupStatus>('PUT', '/system/typesafe-key', { key }),
+  removeTypesafeKey: () => request<SetupStatus>('DELETE', '/system/typesafe-key'),
   removeGitHubToken: () => request<SetupStatus>('DELETE', '/system/github-token'),
   requestAgentLogin: (kind: AgentLoginKind) => request<AgentHost>('POST', '/system/agents/login', { kind }),
   cancelAgentLogin: () => request<AgentHost>('DELETE', '/system/agents/login'),

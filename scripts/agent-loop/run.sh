@@ -80,9 +80,25 @@ current_step() {
     jq -nRr --arg cwd "$PWD" "$RUN_STEP" 2>/dev/null
 }
 
+# The tokens a run that is going on has used so far, for its heartbeat: the input, output and cache tokens of each of
+# its model's responses in claude's output, subagents' included. A response that came in several parts repeats its
+# usage in each, so each counts once, with its latest. Prints nothing before the first response.
+read -r -d '' RUN_TOKENS <<'JQ'
+reduce (inputs | try fromjson catch null | objects | select(.type == "assistant") | .message | objects
+  | select(.id and .usage)) as $m ({}; .[$m.id] = ($m.usage | (.input_tokens // 0) + (.output_tokens // 0)
+    + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)))
+| if . == {} then empty else add end
+JQ
+
+# Prints the tokens used so far by the run whose output (claude's stream-json) is in the given file (see RUN_TOKENS).
+current_tokens() {
+  grep -F '"type":"assistant"' "$1" 2>/dev/null | jq -nR "$RUN_TOKENS" 2>/dev/null
+}
+
 # A run's record, the body of POST /tickets/:id/runs (see RunRecord in shared/domain.ts), from RUN_SUMMARY's output
 # and what the loop knows: $outcome, the exit $code, the $duration in ms, the run's $usage (USAGE's output, or null)
-# for its cost, and the end of what claude printed to stderr ($errors), the message of a run that left no other.
+# for its tokens and cost, and the end of what claude printed to stderr ($errors), the message of a run that left no
+# other.
 # The message is clipped to 4000 characters (RUN_MESSAGE_MAX), and a run of more than 150 tool calls (RUN_MAX_STEPS)
 # keeps its first and last 75, saying how many were left out between them.
 read -r -d '' RUN_RECORD <<'JQ'
@@ -91,7 +107,9 @@ def clip($n): if length > $n then .[:($n - 1)] + "…" else . end;
 | (.steps // []) as $steps
 | ($steps | length) as $count
 | {agent: $agent, outcome: $outcome, exitCode: $code, durationMs: $duration,
-   turns: (.result.num_turns // .turns // null), costUsd: (($usage | objects | .costUsd) // null),
+   turns: (.result.num_turns // .turns // null),
+   tokens: ($usage | objects | .inputTokens + .outputTokens + .cacheReadTokens + .cacheWriteTokens) // null,
+   costUsd: (($usage | objects | .costUsd) // null),
    message: (((.result.result // .text // (.output // [] | join("\n"))) | strings | select(test("\\S"))) // $errors
      | clip(4000)),
    steps: (if $count > 2 * $half then $steps[:$half] + $steps[($count - $half):] else $steps end),
@@ -187,9 +205,11 @@ stop_reason() {
 # takes the ticket away from the agent or asks for the run to stop, writing why to the given file (see stop_reason).
 # Each check also tells the board the agent is working on the ticket, so the board doesn't count it as idle. Every
 # RUN_STEP_SECONDS it also reads the run's latest tool call from its output file (see current_step), and tells the
-# board when it changed, so the ticket shows what the run does as it goes.
+# board when it changed, so the ticket shows what the run does as it goes. Each heartbeat also says how many tokens
+# the run has used so far (see current_tokens), so a runaway run shows while it goes on.
 watch_run() {
   local id=$1 pid=$2 file=$3 output=$4 idle= reason step due checked=$SECONDS interval=$TICKET_CHECK_SECONDS
+  local run_tokens=
   trap - INT TERM
   if [[ -n $lock_fd ]]; then exec {lock_fd}>&-; fi
   ((RUN_STEP_SECONDS > 0 && RUN_STEP_SECONDS < interval)) && interval=$RUN_STEP_SECONDS
@@ -203,6 +223,7 @@ watch_run() {
     elif ((!due)); then
       continue
     fi
+    run_tokens=$(current_tokens "$output")
     heartbeat "$id"
     ((due)) || continue
     checked=$SECONDS
@@ -402,6 +423,9 @@ run_claude() {
 Put scratch files (clones, builds, test output, screenshots) in \$TMPDIR ($scratch), not in /tmp: /tmp may be held \
 in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it once the ticket's run finishes."
   fi
+  # The board's agentMaxTurns, when set, caps how many turns the run may take.
+  max_turns=$(get "/boards/$BOARD" | jq -r '.board.agentMaxTurns // empty' 2>/dev/null)
+  [[ $max_turns =~ ^[0-9]+$ ]] || max_turns=
   run=$(new_session_id)
   started=$(date +%s%3N)
   (
@@ -410,8 +434,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
     # The marker stop_leftovers looks for, inherited by everything the run starts.
     export ULTRAKANBAN_RUN=$run
     if [[ -n $scratch ]]; then export TMPDIR=$scratch; fi
-    exec timeout --foreground "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
-      ${skill_args[@]+"${skill_args[@]}"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
+    exec timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
+      ${skill_args[@]+"${skill_args[@]}"} ${max_turns:+--max-turns "$max_turns"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
   ) <<<"$prompt" >"$output" 2>"$errors" &
   running=$!
   inhibit_sleep "$id" "$running"
@@ -419,6 +443,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   watcher=$!
   wait "$running"
   code=$?
+  # A signal for the loop interrupts wait while the run is still stopping (see the INT/TERM trap).
+  while kill -0 "$running" 2>/dev/null; do wait "$running"; code=$?; done
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   end_run "$id"
@@ -448,6 +474,7 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   fi
   record_run "$id" "$code" "$summary" "$usage" "$(($(date +%s%3N) - started))"
   rm -f "$output" "$errors" "$stopped"
+  if [[ -n $stopping ]]; then exit 0; fi
   return "$code"
 }
 
@@ -508,13 +535,16 @@ from origin with no local changes."
     elif [[ -n $branch ]]; then
       prompt+="
 
-The repository is checked out on $branch, freshly updated from origin$(
-        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' " with no local changes")."
+The repository is checked out on $branch$(
+        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' ", freshly updated from origin with no local changes")."
     fi
-    update_state "$id" '.session = ($v | fromjson) | del(.stopped)' \
+    update_state "$id" '.session = ($v | fromjson) | del(.stopped) | .runStart = (now | floor)' \
       "$(jq -nc --arg id "$session" --arg checkout "$PWD" '{id: $id, checkout: $checkout}')"
     run_claude "$id" "$prompt" "$start" "$session"
     code=$?
+    # When the run started and ended, so that TRIAGE doesn't take the pull request comments it posted (without the
+    # marker) for feedback. The last 20 runs are kept.
+    update_state "$id" '.runs = ((.runs // []) + [[.runStart // (now | floor), (now | ceil)]])[-20:] | del(.runStart)'
     if [[ $code == 0 && ${AGENT_LOOP_CLEAN:-0} == 1 ]]; then rm -f "$(run_file)"; fi
     checkout "" >/dev/null # back to the default branch between runs, keeping the work of a run that didn't finish
   else
@@ -522,7 +552,8 @@ The repository is checked out on $branch, freshly updated from origin$(
     log "can't update the checkout for $id"
   fi
   if [[ $code == 0 ]]; then
-    write_state "$id" "$snapshot"
+    write_state "$id" "$(jq -c --argjson s "$(read_state "$id")" '. + ($s | {runs} | with_entries(select(.value != null)))' \
+      <<<"$snapshot")"
     remove_scratch "$id"
     return 0
   fi

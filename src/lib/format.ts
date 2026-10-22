@@ -115,10 +115,11 @@ export function formatRunOutcome(run: Pick<RunRecord, 'outcome' | 'exitCode'>) {
 }
 
 /** What a run took, e.g. `23m · 41 turns · $1.20`, leaving out what it didn't report. */
-export function formatRunTotals(run: Pick<RunRecord, 'durationMs' | 'turns' | 'costUsd'>) {
+export function formatRunTotals(run: Pick<RunRecord, 'durationMs' | 'turns' | 'tokens' | 'costUsd'>) {
   return [
     run.durationMs !== null && formatDuration(run.durationMs),
     run.turns !== null && `${run.turns} ${run.turns === 1 ? 'turn' : 'turns'}`,
+    run.tokens !== null && `${formatTokens(run.tokens)} tokens`,
     run.costUsd !== null && formatCost(run.costUsd),
   ]
     .filter(Boolean)

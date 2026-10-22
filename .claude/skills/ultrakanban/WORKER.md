@@ -81,7 +81,7 @@ End every pull request comment, review and inline reply with `<!-- ultrakanban:<
 ## Errors
 
 `409 already_claimed` / `claimed_by_other`: not yours, don't touch. `409 version_conflict`: re-read and redo.
-`409 awaiting_approval`: stop. `404 usage_reserve_reached`: stop and report.
+`409 awaiting_approval`: stop. `429 usage_reserve_reached`: stop and report.
 
 Filing tickets, epics, splitting a ticket into sub-tickets and orchestration are in the full skill, `SKILL.md` in the
 ultrakanban repository (`.claude/skills/ultrakanban/SKILL.md`), or `GET $KANBAN/api`.

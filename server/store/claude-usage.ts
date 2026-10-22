@@ -1,4 +1,10 @@
-import { CLAUDE_USAGE_FRESH_MINUTES, type ClaudeUsage, type ClaudeUsageLimit, reserveFor } from '../../shared/domain.ts'
+import {
+  CLAUDE_USAGE_FRESH_MINUTES,
+  type ClaudeUsage,
+  type ClaudeUsageCredit,
+  type ClaudeUsageLimit,
+  reserveFor,
+} from '../../shared/domain.ts'
 import type { ReportClaudeUsageInput, SetUsageReserveInput } from '../../shared/schemas.ts'
 import { now, sql } from '../db.ts'
 
@@ -7,9 +13,11 @@ interface ClaudeUsageRow {
   limits_at: string | null
   plan: string | null
   limits: string
+  credits: string
   error: string | null
   week_reserve_percent: number | null
   session_reserve_percent: number | null
+  usage_credits: number
 }
 
 /** When a limit resets; never for one that isn't running (no reset time). */
@@ -21,9 +29,10 @@ const liftsAfter = (a: ClaudeUsageLimit, b: ClaudeUsageLimit) =>
 
 /**
  * The limit that holds agents back with the usage reserve at `at` (see `ClaudeUsage.reserveReached`): of the limits at
- * or over their reserve that haven't reset since they were read, the one that lifts last, when they are fresh. Stale
- * or missing limits never hold them back (they fail open), so agents don't stop with a supervisor that did, or one
- * that can't read the usage any more.
+ * or over their reserve that haven't reset since they were read, the one that lifts last, when they are fresh. Unless
+ * agents may spend usage credits, a limit that is used up holds them back without a reserve too. Stale or missing
+ * limits never hold them back (they fail open), so agents don't stop with a supervisor that did, or one that can't
+ * read the usage any more.
  */
 export function reserveReached(
   { limitsAt, limits, reserve }: Pick<ClaudeUsage, 'limitsAt' | 'limits' | 'reserve'>,
@@ -31,7 +40,7 @@ export function reserveReached(
 ): ClaudeUsageLimit | null {
   if (!limitsAt || Date.parse(limitsAt) < at - CLAUDE_USAGE_FRESH_MINUTES * 60_000) return null
   const reached = limits.filter((limit) => {
-    const percent = reserveFor(limit, reserve)
+    const percent = reserveFor(limit, reserve) ?? (reserve.usageCredits ? null : 100)
     // Past its reset time a limit starts again from nothing, even before the next report says so.
     const running = limit.resetsAt === null || Date.parse(limit.resetsAt) > at
     return percent !== null && running && limit.percent >= percent
@@ -48,21 +57,30 @@ function toClaudeUsage(row: ClaudeUsageRow): ClaudeUsage {
     limitsAt: row.limits_at,
     plan: row.plan,
     limits: JSON.parse(row.limits) as ClaudeUsageLimit[],
+    credits: JSON.parse(row.credits) as ClaudeUsageCredit[],
     error: row.error,
-    reserve: { week: row.week_reserve_percent, session: row.session_reserve_percent },
+    reserve: {
+      week: row.week_reserve_percent,
+      session: row.session_reserve_percent,
+      usageCredits: row.usage_credits === 1,
+    },
   }
   return { ...usage, reserveReached: reserveReached(usage) }
 }
 
 export const getClaudeUsage = () => toClaudeUsage(sql.get<ClaudeUsageRow>('SELECT * FROM claude_usage WHERE id = 1')!)
 
-/** Sets the usage reserve of the week, the current session or both (see `ClaudeUsageReserve`); null switches it off. */
-export function setUsageReserve({ week, session }: SetUsageReserveInput): ClaudeUsage {
+/**
+ * Sets the usage reserve of the week, the current session or both (see `ClaudeUsageReserve`), null switching it off,
+ * and whether agents may spend usage credits.
+ */
+export function setUsageReserve({ week, session, usageCredits }: SetUsageReserveInput): ClaudeUsage {
   const current = getClaudeUsage().reserve
   sql.run(
-    'UPDATE claude_usage SET week_reserve_percent = ?, session_reserve_percent = ? WHERE id = 1',
+    'UPDATE claude_usage SET week_reserve_percent = ?, session_reserve_percent = ?, usage_credits = ? WHERE id = 1',
     week === undefined ? current.week : week,
     session === undefined ? current.session : session,
+    (usageCredits ?? current.usageCredits) ? 1 : 0,
   )
   return getClaudeUsage()
 }
@@ -70,13 +88,16 @@ export function setUsageReserve({ week, session }: SetUsageReserveInput): Claude
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+/** A time the usage endpoint gave, or null for anything that isn't one. */
+const timeOf = (value: unknown) => (typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : null)
+
 function toLimit(label: string, percent: unknown, resetsAt: unknown): ClaudeUsageLimit[] {
   if (typeof percent !== 'number' || !Number.isFinite(percent)) return []
   return [
     {
       label,
       percent: Math.min(100, Math.max(0, percent)),
-      resetsAt: typeof resetsAt === 'string' && !Number.isNaN(Date.parse(resetsAt)) ? resetsAt : null,
+      resetsAt: timeOf(resetsAt),
     },
   ]
 }
@@ -113,18 +134,95 @@ export function parseClaudeUsage(usage: Record<string, unknown>): ClaudeUsageLim
   })
 }
 
+const isAmount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
+
+/** An amount of money in the usage endpoint's `{ amount_minor, currency, exponent }`, e.g. 1250 cents for $12.50. */
+function money(value: unknown): { amount: number; currency: string } | null {
+  if (!isObject(value) || !isAmount(value.amount_minor)) return null
+  const exponent = Number.isInteger(value.exponent) ? (value.exponent as number) : 2
+  return {
+    amount: value.amount_minor / 10 ** exponent,
+    currency: typeof value.currency === 'string' ? value.currency : 'USD',
+  }
+}
+
 /**
- * Records what the supervisor read. A report without usage (with only an error, or nothing) keeps the last limits and
- * when they were read, so one failed read doesn't lift the usage reserve: they hold until they go stale.
+ * Usage credits (extra usage), on or off: from `spend`, or the older `extra_usage` (in cents, or `decimal_places`)
+ * without it. Null when the answer has neither.
+ */
+function usageCredits(usage: Record<string, unknown>): ClaudeUsageCredit | null {
+  const { spend, extra_usage: extra } = usage
+  const credit = { kind: 'usage', label: 'Usage credits', resetsAt: null } as const
+  if (isObject(spend)) {
+    const used = money(spend.used)
+    const limit = money(spend.limit)
+    const balance = money(spend.balance)
+    return {
+      ...credit,
+      enabled: spend.enabled === true,
+      currency: used?.currency ?? limit?.currency ?? balance?.currency ?? 'USD',
+      used: used?.amount ?? 0,
+      limit: limit?.amount ?? null,
+      remaining: balance?.amount ?? (limit ? Math.max(0, limit.amount - (used?.amount ?? 0)) : null),
+    }
+  }
+  if (!isObject(extra)) return null
+  const scale = 10 ** (Number.isInteger(extra.decimal_places) ? (extra.decimal_places as number) : 2)
+  const used = isAmount(extra.used_credits) ? extra.used_credits / scale : 0
+  const limit = isAmount(extra.monthly_limit) ? extra.monthly_limit / scale : null
+  return {
+    ...credit,
+    enabled: extra.is_enabled === true,
+    currency: typeof extra.currency === 'string' ? extra.currency : 'USD',
+    used,
+    limit,
+    remaining: limit === null ? null : Math.max(0, limit - used),
+  }
+}
+
+/**
+ * The credits in an answer of the usage endpoint (see `parseClaudeUsage`): every grant of dollars (an entry with
+ * `limit_dollars`, under a name that changes), then usage credits, whether they are on or not. Like the limits,
+ * anything that doesn't look as expected is left out.
+ */
+export function parseClaudeCredits(usage: Record<string, unknown>): ClaudeUsageCredit[] {
+  const grants = Object.values(usage)
+    .filter(isObject)
+    .flatMap((grant): ClaudeUsageCredit[] => {
+      const { limit_dollars: limit, used_dollars: used, remaining_dollars: remaining } = grant
+      if (!isAmount(limit)) return []
+      const spent = isAmount(used) ? used : isAmount(remaining) ? Math.max(0, limit - remaining) : 0
+      return [
+        {
+          kind: 'grant',
+          label: 'Credit grant',
+          enabled: true,
+          currency: 'USD',
+          used: spent,
+          limit,
+          remaining: isAmount(remaining) ? remaining : Math.max(0, limit - spent),
+          resetsAt: timeOf(grant.resets_at),
+        },
+      ]
+    })
+  const credits = usageCredits(usage)
+  return credits ? [...grants, credits] : grants
+}
+
+/**
+ * Records what the supervisor read. A report without usage (with only an error, or nothing) keeps the last limits,
+ * credits and when the limits were read, so one failed read doesn't lift the usage reserve: they hold until they go
+ * stale.
  */
 export function reportClaudeUsage(input: ReportClaudeUsageInput): ClaudeUsage {
   const current = getClaudeUsage()
   const at = now()
   sql.run(
-    'UPDATE claude_usage SET reported_at = ?, plan = ?, limits = ?, limits_at = ?, error = ? WHERE id = 1',
+    'UPDATE claude_usage SET reported_at = ?, plan = ?, limits = ?, credits = ?, limits_at = ?, error = ? WHERE id = 1',
     at,
     input.plan === undefined ? current.plan : input.plan,
     JSON.stringify(input.usage ? parseClaudeUsage(input.usage) : current.limits),
+    JSON.stringify(input.usage ? parseClaudeCredits(input.usage) : current.credits),
     input.usage ? at : current.limitsAt,
     input.usage ? null : (input.error ?? current.error),
   )

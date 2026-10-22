@@ -33,6 +33,7 @@ export type BoardPatch = Partial<
     | 'agentAllSkills'
     | 'agentDocker'
     | 'autoMerge'
+    | 'ignoreBillingFailures'
     | 'deleteMergedBranches'
     | 'archiveDoneDays'
     | 'approvalSize'

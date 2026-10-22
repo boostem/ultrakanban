@@ -26,14 +26,20 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { useGitHubStatus } from '@/hooks/queries'
+import { useGitHubStatus, useSetup } from '@/hooks/queries'
+import type { BoardPatch } from '@/lib/board-updates'
 import { cn } from '@/lib/utils'
 import {
   AGENT_DEFAULTS,
   AGENT_EFFORTS,
   AGENT_MAX_CONCURRENCY,
+  AGENT_MODELS,
   type AgentEffort,
+  type AgentModelAlias,
   agentWorkerName,
+  type BoardSummary,
+  JEV_DEFAULTS,
+  type JevMode,
   TICKET_SIZES,
   type TicketSize,
 } from '@shared/domain'
@@ -199,6 +205,172 @@ export function BoardSettingsDialog({ open, onOpenChange }: { open: boolean; onO
   )
 }
 
+type JevSettings = Pick<BoardSummary, 'jevEnabled' | 'jevModels' | 'jevThreshold' | 'jevOnlyLower' | 'jevMode'>
+
+/** The board's "Route with Jev" settings (see docs/JEV.md); only shown when a TypeSafe API key is set. */
+function JevFieldset({ value, onChange }: { value: JevSettings; onChange: (value: JevSettings) => void }) {
+  const models = value.jevModels ?? [...AGENT_MODELS]
+  const toggleModel = (model: AgentModelAlias, checked: boolean) => {
+    const next = AGENT_MODELS.filter((each) => (each === model ? checked : models.includes(each)))
+    if (next.length) onChange({ ...value, jevModels: next.length === AGENT_MODELS.length ? null : next })
+  }
+  return (
+    <fieldset className="grid gap-3 border-t pt-4">
+      <legend className="sr-only">Route with Jev</legend>
+      <div className="grid gap-1">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={value.jevEnabled}
+            onChange={(event) =>
+              onChange({
+                ...value,
+                jevEnabled: event.target.checked,
+                jevMode: value.jevMode ?? (event.target.checked ? JEV_DEFAULTS.mode : null),
+              })
+            }
+            className="size-4 accent-primary"
+          />
+          Route with Jev
+        </label>
+        <p className="pl-6 text-xs text-muted-foreground">
+          Lets TypeSafe's Jev pick the model and effort for tickets that don't set their own. Each ticket's title,
+          description and tags are sent to TypeSafe to do that. Starts in dry run, which only records Jev's picks, so
+          you can see how it would have done before using them.
+        </p>
+      </div>
+      {value.jevEnabled && (
+        <>
+          <div className="grid gap-2">
+            <Label htmlFor="board-settings-jev-mode">Mode</Label>
+            <Select
+              value={value.jevMode ?? JEV_DEFAULTS.mode}
+              onValueChange={(mode) => onChange({ ...value, jevMode: mode as JevMode })}
+            >
+              <SelectTrigger id="board-settings-jev-mode" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="dry-run">Dry run: record Jev's pick, don't use it</SelectItem>
+                <SelectItem value="on">On: work tickets with Jev's pick</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-2">
+            <span className="text-sm font-medium">Models Jev may pick</span>
+            <div className="flex flex-wrap gap-x-4 gap-y-1">
+              {AGENT_MODELS.map((model) => (
+                <label key={model} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={models.includes(model)}
+                    onChange={(event) => toggleModel(model, event.target.checked)}
+                    className="size-4 accent-primary"
+                  />
+                  {model}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="grid gap-1">
+            <div className="flex items-center gap-2 text-sm">
+              <Label htmlFor="board-settings-jev-threshold" className="font-normal">
+                Use its pick from a confidence of
+              </Label>
+              <Input
+                id="board-settings-jev-threshold"
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={value.jevThreshold ?? ''}
+                onChange={(event) => {
+                  const threshold = event.target.value === '' ? null : Number(event.target.value)
+                  onChange({ ...value, jevThreshold: threshold === null || Number.isNaN(threshold) ? null : threshold })
+                }}
+                placeholder={String(JEV_DEFAULTS.threshold)}
+                className="h-7 w-20"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Below it, the ticket is worked at the history suggestion or the board's setting instead.
+            </p>
+          </div>
+          <div className="grid gap-1">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={value.jevOnlyLower}
+                onChange={(event) => onChange({ ...value, jevOnlyLower: event.target.checked })}
+                className="size-4 accent-primary"
+              />
+              Only pick cheaper settings
+            </label>
+            <p className="pl-6 text-xs text-muted-foreground">
+              Jev may pick a cheaper model or lower effort than the board's agent setting, never a dearer one.
+            </p>
+          </div>
+        </>
+      )}
+    </fieldset>
+  )
+}
+
+type FixRuns = Pick<BoardSummary, 'agentConflictModel' | 'agentConflictEffort' | 'agentCiModel' | 'agentCiEffort'>
+
+/** Model and effort fields for one kind of fix run (merge conflicts or failing CI); empty is the default. */
+function FixRunFields({
+  id,
+  label,
+  model,
+  effort,
+  defaults,
+  onChange,
+}: {
+  id: string
+  label: string
+  model: string | null
+  effort: AgentEffort | null
+  defaults: { model: string; effort: AgentEffort }
+  onChange: (model: string | null, effort: AgentEffort | null) => void
+}) {
+  return (
+    <>
+      <div className="grid gap-2">
+        <Label htmlFor={`board-settings-${id}-model`}>{label} model</Label>
+        <Input
+          id={`board-settings-${id}-model`}
+          value={model ?? ''}
+          placeholder={defaults.model}
+          pattern="[\w.:\[\]\-]+(/[\w.:\[\]\-]+)*"
+          maxLength={100}
+          title="A model alias or name, e.g. sonnet, claude-sonnet-5-5 or qwen3-coder:30b"
+          onChange={(event) => onChange(event.target.value.trim() || null, effort)}
+        />
+      </div>
+      <div className="grid gap-2">
+        <Label htmlFor={`board-settings-${id}-effort`}>{label} effort</Label>
+        <Select
+          value={effort ?? DEFAULT_EFFORT}
+          onValueChange={(value) => onChange(model, value === DEFAULT_EFFORT ? null : (value as AgentEffort))}
+        >
+          <SelectTrigger id={`board-settings-${id}-effort`} className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={DEFAULT_EFFORT}>Default ({defaults.effort})</SelectItem>
+            {AGENT_EFFORTS.map((level) => (
+              <SelectItem key={level} value={level}>
+                {level}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </>
+  )
+}
+
 /** Mounted with the dialog's content, so it starts from the saved settings each time the dialog opens. */
 function BoardSettingsForm({ onClose }: { onClose: () => void }) {
   const { detail, actions } = useBoardContext()
@@ -210,11 +382,20 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
   const [agentEnabled, setAgentEnabled] = useState(detail.board.agentEnabled)
   const [agentConcurrency, setAgentConcurrency] = useState(detail.board.agentConcurrency)
   const [agentConflictConcurrency, setAgentConflictConcurrency] = useState(detail.board.agentConflictConcurrency)
+  const [fixRuns, setFixRuns] = useState<FixRuns>(() => {
+    const { agentConflictModel, agentConflictEffort, agentCiModel, agentCiEffort } = detail.board
+    return { agentConflictModel, agentConflictEffort, agentCiModel, agentCiEffort }
+  })
   const [githubRepo, setGithubRepo] = useState(detail.board.githubRepo ?? '')
   const [notifyUrl, setNotifyUrl] = useState(detail.board.notifyUrl ?? '')
   const [creatingRepo, setCreatingRepo] = useState(false)
   const signedIn = !!useGitHubStatus().data?.auth
   const hasBacklog = detail.columns.some((column) => column.name.toLowerCase() === 'backlog')
+  const hasTypesafeKey = !!useSetup().data?.typesafe.source
+  const [jev, setJev] = useState<JevSettings>(() => {
+    const { jevEnabled, jevModels, jevThreshold, jevOnlyLower, jevMode } = detail.board
+    return { jevEnabled, jevModels, jevThreshold, jevOnlyLower, jevMode }
+  })
   const tabs = useRef<(HTMLButtonElement | null)[]>([])
   const form = useRef<HTMLFormElement>(null)
   const content = useRef<HTMLDivElement>(null)
@@ -277,8 +458,12 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
     }
     const text = (field: string) => String(data.get(field) ?? '').trim() || null
     const archiveDays = Number(text('archiveDoneDays'))
+    const maxTurns = Number(text('agentMaxTurns'))
     const approvalSize = String(data.get('approvalSize') ?? NONE)
+    // Left alone without a key, as the settings aren't shown then.
+    const jevPatch: BoardPatch = hasTypesafeKey ? jev : {}
     void actions.updateBoard({
+      ...jevPatch,
       name,
       description: String(data.get('description') ?? ''),
       reviewColumnId: columnId('reviewColumn'),
@@ -288,7 +473,9 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
       agentModel: text('agentModel'),
       agentEffort: agent.agentEffort,
       agentConcurrency,
+      agentMaxTurns: maxTurns >= 1 ? Math.round(maxTurns) : null,
       agentConflictConcurrency,
+      ...fixRuns,
       agentEnabled: data.get('agentEnabled') === 'on',
       agentBacklog: data.get('agentBacklog') === 'on',
       agentAllSkills: data.get('agentAllSkills') === 'on',
@@ -559,6 +746,19 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
                   </Hint>
                 </div>
                 <div className="grid content-start gap-2">
+                  <Label htmlFor="board-settings-agent-max-turns">Max turns per run</Label>
+                  <Input
+                    id="board-settings-agent-max-turns"
+                    name="agentMaxTurns"
+                    type="number"
+                    min={1}
+                    max={10000}
+                    step={1}
+                    defaultValue={detail.board.agentMaxTurns ?? ''}
+                    placeholder="no limit"
+                  />
+                </div>
+                <div className="grid content-start gap-2">
                   <Label htmlFor="board-settings-agent-conflict-concurrency">Parallel conflict fixes</Label>
                   <Select
                     value={String(agentConflictConcurrency ?? DEFAULT_CONCURRENCY)}
@@ -587,6 +787,30 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
                   </Hint>
                 </div>
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <FixRunFields
+                  id="conflict"
+                  label="Conflict fix"
+                  model={fixRuns.agentConflictModel}
+                  effort={fixRuns.agentConflictEffort}
+                  defaults={{ model: AGENT_DEFAULTS.conflictModel, effort: AGENT_DEFAULTS.conflictEffort }}
+                  onChange={(model, effort) =>
+                    setFixRuns({ ...fixRuns, agentConflictModel: model, agentConflictEffort: effort })
+                  }
+                />
+                <FixRunFields
+                  id="ci"
+                  label="CI fix"
+                  model={fixRuns.agentCiModel}
+                  effort={fixRuns.agentCiEffort}
+                  defaults={{ model: AGENT_DEFAULTS.ciModel, effort: AGENT_DEFAULTS.ciEffort }}
+                  onChange={(model, effort) => setFixRuns({ ...fixRuns, agentCiModel: model, agentCiEffort: effort })}
+                />
+              </div>
+              <Hint>
+                Runs started only to fix merge conflicts, or only to fix failing CI, use these instead of the ticket's
+                model and effort, as they rarely need it. A run that also answers someone's feedback keeps the ticket's.
+              </Hint>
             </Group>
 
             <Group title="Picking tickets">
@@ -641,6 +865,8 @@ function BoardSettingsForm({ onClose }: { onClose: () => void }) {
                 listed in each request a run makes, which costs tokens.
               </CheckboxField>
             </Group>
+
+            {hasTypesafeKey && <JevFieldset value={jev} onChange={setJev} />}
           </Section>
 
           <Section

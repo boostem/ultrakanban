@@ -18,6 +18,7 @@ import {
   needsApproval,
   QUESTION_TAG,
   reserveFor,
+  type CompactTicket,
   type Ticket,
   type TicketSize,
 } from '../../shared/domain.ts'
@@ -81,6 +82,9 @@ interface TicketRow {
   stop_requested_by: string | null
   estimate: TicketSize | null
   approval: Approval | null
+  routed_model: string | null
+  routed_effort: AgentEffort | null
+  routed_confidence: number | null
   position: number
   version: number
   moved_at: string
@@ -106,7 +110,10 @@ interface TicketRow {
  * column, and its pull request wasn't closed). Null when it isn't waiting. Needs the ticket as `t`.
  */
 export const WAITING_SINCE = `
-  (SELECT CASE WHEN a.actor = t.assignee AND (a.type = 'comment' OR t.approval = 'pending') THEN a.created_at END
+  (SELECT CASE WHEN (a.actor = t.assignee OR a.actor = substr(t.assignee, 1, instr(t.assignee || '/', '/') - 1)
+                         OR a.actor = substr(t.assignee, 1, instr(t.assignee || '/', '/') - 1) || '-loop'
+                         OR a.actor LIKE substr(t.assignee, 1, instr(t.assignee || '/', '/') - 1) || '/%')
+                        AND (a.type = 'comment' OR t.approval = 'pending') THEN a.created_at END
    FROM activity a JOIN boards b ON b.id = t.board_id
    WHERE a.ticket_id = t.id AND a.type IN ('comment', 'plan')
      AND t.column_id IS NOT b.review_column_id AND t.column_id IS NOT b.done_column_id AND t.pr_state != 'closed'
@@ -133,6 +140,9 @@ const SELECT_TICKETS = `
     (SELECT sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) FROM token_usage
       WHERE ticket_id = t.id) AS usage_tokens,
     (SELECT sum(cost_usd) FROM token_usage WHERE ticket_id = t.id) AS usage_cost,
+    (SELECT model FROM ticket_routes WHERE ticket_id = t.id AND source = 'jev') AS routed_model,
+    (SELECT effort FROM ticket_routes WHERE ticket_id = t.id AND source = 'jev') AS routed_effort,
+    (SELECT confidence FROM ticket_routes WHERE ticket_id = t.id AND source = 'jev') AS routed_confidence,
     ${WAITING_SINCE} AS waiting_since,
     (SELECT count(*) ${SUBTICKETS}) AS subtickets_total,
     (SELECT count(*) ${SUBTICKETS} AND ${SUBTICKET_DONE}) AS subtickets_done,
@@ -209,6 +219,10 @@ const toTicket = (row: TicketRow): Ticket => ({
   waitingSince: row.waiting_since,
   estimate: row.estimate,
   approval: row.approval,
+  jevPick:
+    row.routed_model && row.routed_effort
+      ? { model: row.routed_model, effort: row.routed_effort, confidence: row.routed_confidence }
+      : null,
   movedAt: row.moved_at,
   archived: row.archive_days !== null && Date.parse(row.moved_at) < Date.now() - row.archive_days * DAY_MS,
   autoMergeWait: autoMergeWaitOf(row),
@@ -313,12 +327,40 @@ export function listTickets(boardId: string, query: ListTicketsQuery = {}): Tick
     params.push(...query.priority.map(priorityRank))
   }
   if (query.q) {
-    where.push("(t.title LIKE ? OR t.description LIKE ? OR ('#' || t.number) = ?)")
-    params.push(`%${query.q}%`, `%${query.q}%`, query.q.startsWith('#') ? query.q : `#${query.q}`)
+    // Escape LIKE's wildcards (and the escape character itself) so the search text matches literally
+    const pattern = `%${query.q.replace(/[\\%_]/g, (char) => `\\${char}`)}%`
+    where.push("(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\' OR ('#' || t.number) = ?)")
+    params.push(pattern, pattern, query.q.startsWith('#') ? query.q : `#${query.q}`)
   }
 
   return sql.all<TicketRow>(`${SELECT_TICKETS} WHERE ${where.join(' AND ')} ${BOARD_ORDER}`, ...params).map(toTicket)
 }
+
+/** The ticket as `?compact=true` lists it (see `CompactTicket`). */
+export const compactTicket = (ticket: Ticket): CompactTicket => ({
+  id: ticket.id,
+  number: ticket.number,
+  columnId: ticket.columnId,
+  title: ticket.title,
+  priority: ticket.priority,
+  assignee: ticket.assignee,
+  tagIds: ticket.tagIds,
+  epicId: ticket.epicId,
+  parentId: ticket.parentId,
+  version: ticket.version,
+  estimate: ticket.estimate,
+  approval: ticket.approval,
+  waitingSince: ticket.waitingSince,
+  archived: ticket.archived,
+  subtickets: ticket.subtickets,
+  commentCount: ticket.commentCount,
+  pullRequest: ticket.pullRequest && {
+    url: ticket.pullRequest.url,
+    state: ticket.pullRequest.state,
+    checks: ticket.pullRequest.checks,
+    conflicts: ticket.pullRequest.conflicts,
+  },
+})
 
 function assertVersion(ticket: Ticket, ifVersion: number | undefined) {
   if (ifVersion !== undefined && ticket.version !== ifVersion) {
@@ -612,11 +654,39 @@ export function claimTicket(id: string, input: ClaimTicketInput): Ticket {
   if (ticket.assignee && ticket.assignee !== input.agent) {
     throw conflict('already_claimed', `Ticket is already claimed by "${ticket.assignee}"`, { ticket })
   }
+  // A ticket the agent already holds stays its own, whatever has come up since.
+  if (ticket.assignee !== input.agent) assertClaimable(ticket)
   touchBoard(ticket.boardId)
   assign(ticket, input.agent, input.agent)
   if (input.moveTo) relocate(ticket, input.moveTo, undefined, input.agent)
   bumpVersion(id)
   return getTicket(id)
+}
+
+/**
+ * The checks `claimNextTicket` applies when it picks a ticket, for claiming a specific one: no new claims while the
+ * usage reserve holds agents back (429 `usage_reserve_reached`), and none on a ticket that is blocked (409 `blocked`):
+ * tagged `blocked`, waiting for an unfinished ticket (`blocked by #12`), or with unfinished sub-tickets.
+ */
+function assertClaimable(ticket: Ticket) {
+  assertBelowUsageReserve()
+  const tagged = sql.get(
+    `SELECT 1 FROM ticket_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.ticket_id = ? AND lower(g.name) = ?`,
+    ticket.id,
+    BLOCKED_TAG,
+  )
+  const unfinishedSubtickets = sql.get(
+    `SELECT 1 FROM tickets t WHERE t.id = ? AND EXISTS (SELECT 1 ${SUBTICKETS} AND NOT ${SUBTICKET_DONE})`,
+    ticket.id,
+  )
+  const reason = tagged
+    ? `tagged "${BLOCKED_TAG}"; a person has to remove the tag`
+    : waitsForOpenTicket(ticket.boardId, ticket)
+      ? 'it waits for a ticket it says it is blocked by, which is not finished yet'
+      : unfinishedSubtickets
+        ? 'its sub-tickets are not all finished yet'
+        : null
+  if (reason) throw conflict('blocked', `Ticket is blocked: ${reason}`, { ticket })
 }
 
 export function releaseTicket(id: string, input: ReleaseTicketInput): Ticket {
@@ -664,6 +734,7 @@ export function recordHeartbeat(id: string, input: HeartbeatInput) {
     id,
   )
   if (!run || step !== run.step) publish({ boardId: row.board_id })
+  return { stopRequested: run?.stopRequested ?? null }
 }
 
 /** Ends the run working the ticket, if any: the agent says it has stopped. Its stop request, if any, goes with it. */
@@ -717,18 +788,25 @@ export function listIdleTickets(columnId: string): Ticket[] {
     .map(toTicket)
 }
 
-/** Unassigns a column's idle tickets (see `listIdleTickets`) and moves them to another column. Returns them. */
+/** Unassigns a column's idle tickets (see `listIdleTickets`) and moves them to another column. Returns them. Tickets that can't enter the target (e.g. no merged pull request for the done column) stay as they are. */
 export function releaseIdleTickets(columnId: string, input: ReleaseIdleInput, actor: string): Ticket[] {
   const column = getColumn(columnId)
   const target = resolveColumn(column.boardId, input.moveTo)
   if (target.id === column.id) throw badRequest('Idle tickets must move to another column')
-  return listIdleTickets(columnId).map((ticket) => {
+  const released: Ticket[] = []
+  for (const ticket of listIdleTickets(columnId)) {
+    try {
+      assertCanEnter(ticket, target)
+    } catch {
+      continue
+    }
     touchBoard(ticket.boardId)
     assign(ticket, null, actor)
     relocate(ticket, target.id, undefined, actor)
     bumpVersion(ticket.id)
-    return getTicket(ticket.id)
-  })
+    released.push(getTicket(ticket.id))
+  }
+  return released
 }
 
 /**
@@ -748,10 +826,16 @@ function assertBelowUsageReserve() {
         `(agents may spend them if the usage reserve allows it). `
       : `Agents claim no new tickets while the rest of ${kept} is kept for people's own work: ` +
         `${limit.label} is at ${Math.round(limit.percent)}%, and its usage reserve starts at ${reservePercent}%. `
-  throw new HttpError(404, 'usage_reserve_reached', `${why}Tickets agents already hold can still be worked.${resets}`, {
-    limit,
-    reservePercent,
-  })
+  const untilReset = limit.resetsAt ? Math.ceil((Date.parse(limit.resetsAt) - Date.now()) / 1000) : NaN
+  const error = new HttpError(
+    429,
+    'usage_reserve_reached',
+    `${why}Tickets agents already hold can still be worked.${resets}`,
+    { limit, reservePercent },
+  )
+  // Until the limit resets; an unknown or past reset time falls back to five minutes.
+  error.retryAfter = untilReset > 0 ? untilReset : 300
+  throw error
 }
 
 /**
@@ -873,7 +957,7 @@ export function approvePlan(id: string, input: ApprovePlanInput, actor: string):
   if (ticket.approval !== 'pending') {
     throw conflict('not_awaiting_approval', "The ticket's plan doesn't wait for approval", { ticket })
   }
-  if (ticket.assignee && actor === ticket.assignee) {
+  if (ticket.assignee && isAgentOf(ticket.assignee, actor)) {
     throw conflict('own_plan', "The ticket's agent can't approve its own plan; a person has to", { ticket })
   }
   touchBoard(ticket.boardId)

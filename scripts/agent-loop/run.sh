@@ -149,8 +149,7 @@ limit_reset() {
 # IDLE_COLUMNS. That is a kind and a text, separated by a tab:
 #   taken      why the agent no longer has the ticket: someone else moved it to one of those columns, unassigned it or
 #              gave it to someone else, or deleted it
-#   requested  who asked for the run to stop (POST /tickets/:id/stop, the Stop button), e.g. to give it new
-#              instructions; the ticket is still the agent's
+# (A request to stop the run, POST /tickets/:id/stop, comes back with the heartbeat: see watch_run.)
 # Fails while the run may go on, including when the agent moved or released the ticket itself (e.g. to the cancelled
 # column, as the skill says to when its pull request was closed).
 stop_reason() {
@@ -178,9 +177,7 @@ stop_reason() {
       return 0
     fi
   fi
-  by=$(jq -r '.run.stopRequested.by // empty' <<<"$ticket") || return 1
-  [[ -n $by ]] || return 1
-  printf 'requested\t%s\n' "$by"
+  return 1
 }
 
 # Checks a run's ticket every TICKET_CHECK_SECONDS while the run (process pid) goes on, and stops the run if someone
@@ -204,16 +201,18 @@ watch_run() {
       continue
     fi
     heartbeat "$id"
+    if [[ -n $stop_requested_by ]]; then
+      printf 'requested\t%s\n' "$stop_requested_by" >"$file"
+      log "ticket $id: $stop_requested_by asked for its run to stop; stopping it"
+      kill -TERM "$pid"
+      return
+    fi
     ((due)) || continue
     checked=$SECONDS
     [[ -n $idle ]] || idle=$(idle_columns) || { idle=; continue; }
     reason=$(stop_reason "$id" "$idle") || continue
     printf '%s\n' "$reason" >"$file"
-    if [[ $reason == requested$'\t'* ]]; then
-      log "ticket $id: ${reason#*$'\t'} asked for its run to stop; stopping it"
-    else
-      log "ticket $id: ${reason#*$'\t'}; stopping its run"
-    fi
+    log "ticket $id: ${reason#*$'\t'}; stopping its run"
     kill -TERM "$pid"
     return
   done
@@ -268,16 +267,17 @@ stop_leftovers() {
   kill -KILL "${left[@]}" 2>/dev/null
 }
 
-# The skills the next run gets, as arguments for claude (skill_args): only the ultrakanban skill, in the system prompt,
-# unless the board's agentAllSkills is on or the repository has skills or commands of its own.
+# The skills the next run gets, as arguments for claude (skill_args): only the ultrakanban skill, in the system prompt
+# (the short WORKER.md next to SKILL.md when there is one, which leaves out filing and splitting tickets), unless the board's agentAllSkills is on or the repository has skills or commands of its own.
 use_skills() {
   local skill=.claude/skills/ultrakanban/SKILL.md
   skill_args=()
   [[ -f $skill ]] || return 0
   if [[ -n $(find .claude/commands .claude/skills -mindepth 1 -maxdepth 1 ! -path "${skill%/*}" -print -quit \
-    2>/dev/null) ]] || get "/boards/$BOARD" | jq -e .board.agentAllSkills >/dev/null; then
+    2>/dev/null) ]] || board | jq -e .board.agentAllSkills >/dev/null; then
     return 0
   fi
+  [[ -f ${skill%/*}/WORKER.md ]] && skill=${skill%/*}/WORKER.md
   skill_args=(--disable-slash-commands --append-system-prompt "This run has no Skill tool: the ultrakanban skill it \
 uses is already loaded, here.
 
@@ -306,7 +306,7 @@ use_docker() {
   local id=$1 setting git_dir home=$HOME path extra
   docker_args=() docker_error=
   setting=$(get "/tickets/$id" | jq -r 'if .agentDocker == null then empty else .agentDocker end')
-  [[ -n $setting ]] || setting=$(get "/boards/$BOARD" | jq -r '.board.agentDocker // false')
+  [[ -n $setting ]] || setting=$(board | jq -r '.board.agentDocker // false')
   [[ $setting == true ]] || return 0
   if ! "$DOCKER" image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
     if [[ $DOCKER_IMAGE != ultrakanban-agent ]]; then
@@ -402,6 +402,9 @@ run_claude() {
 Put scratch files (clones, builds, test output, screenshots) in \$TMPDIR ($scratch), not in /tmp: /tmp may be held \
 in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it once the ticket's run finishes."
   fi
+  # The board's agentMaxTurns, when set, caps how many turns the run may take.
+  max_turns=$(get "/boards/$BOARD" | jq -r '.board.agentMaxTurns // empty' 2>/dev/null)
+  [[ $max_turns =~ ^[0-9]+$ ]] || max_turns=
   run=$(new_session_id)
   started=$(date +%s%3N)
   (
@@ -410,8 +413,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
     # The marker stop_leftovers looks for, inherited by everything the run starts.
     export ULTRAKANBAN_RUN=$run
     if [[ -n $scratch ]]; then export TMPDIR=$scratch; fi
-    exec timeout --foreground "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
-      ${skill_args[@]+"${skill_args[@]}"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
+    exec timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
+      ${skill_args[@]+"${skill_args[@]}"} ${max_turns:+--max-turns "$max_turns"} --model "$model" --effort "$effort" --output-format stream-json --verbose "$@"
   ) <<<"$prompt" >"$output" 2>"$errors" &
   running=$!
   inhibit_sleep "$id" "$running"
@@ -419,6 +422,8 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   watcher=$!
   wait "$running"
   code=$?
+  # A signal for the loop interrupts wait while the run is still stopping (see the INT/TERM trap).
+  while kill -0 "$running" 2>/dev/null; do wait "$running"; code=$?; done
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   end_run "$id"
@@ -448,18 +453,28 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   fi
   record_run "$id" "$code" "$summary" "$usage" "$(($(date +%s%3N) - started))"
   rm -f "$output" "$errors" "$stopped"
+  if [[ -n $stopping ]]; then exit 0; fi
   return "$code"
 }
 
 new_session_id() { { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid; } | tr 'A-F' 'a-f'; }
 
-# Runs claude on a ticket. On success saves the snapshot as the ticket's watermark; on failure keeps the old one
-# and counts the failure for the backoff.
+# Runs claude on a ticket with the given task (what this run is for: the claim, or the new feedback). On success saves
+# the snapshot as the ticket's watermark; on failure keeps the old one and counts the failure for the backoff.
 #
-# Each run is a claude session whose id is kept in the ticket's state (with the checkout it ran in) until the run
-# ends. A run that didn't end, because the loop or the machine stopped, or that ran out of Claude usage, still has its
-# session there, so the next run on the ticket resumes it (claude --resume) with everything the run already knew and
-# did. A run that failed or timed out starts a new session instead, as resuming it would likely fail the same way.
+# Each run is a claude session whose id is kept in the ticket's state (with the checkout it ran in and the worker that
+# ran it), and the next run on the ticket resumes it (claude --resume) with everything the earlier runs already knew
+# and did, rather than reading the ticket and exploring the code again:
+# - A run that finished keeps its session (`done`), so the run after its plan is approved, and each run for review
+#   feedback, carries on the same conversation.
+# - A run that didn't end, because the loop or the machine stopped, or that ran out of Claude usage, keeps it too
+#   (without `done`), with why it stopped, and the next run picks up where it left off.
+# - A run that failed or timed out drops it, so the retry starts a new session, as resuming it would likely fail the
+#   same way. So does a run whose ticket was taken away.
+# A new session gets the whole prompt: the intro, the board's description, the task and the ticket's checklist steps
+# that aren't checked yet (unless the seventh argument is 0). A resumed one already has all that but the task, so it
+# gets only the task, after a line saying what it continues (resumed_prompt). If the session can't be resumed (claude
+# says "No conversation found", e.g. its history was cleared), the run is started again at once as a new session.
 # Either way, the unfinished work in the checkout is put back first (save_work, restore_work).
 #
 # A run a person stopped (POST /tickets/:id/stop) keeps its session too, with why it stopped, and its work. The ticket
@@ -467,8 +482,8 @@ new_session_id() { { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid; } 
 # at once: its state's `stopped` holds the stopped run's snapshot, which TRIAGE compares the feedback with. The next
 # run resumes the session with that feedback, and drops `stopped`.
 run_on_ticket() {
-  local id=$1 prompt=$2 snapshot=$3 fingerprint=$4 ci_runs=${5:-0} branch=${6:-} code limit why state session \
-    start=--session-id previous work=
+  local id=$1 task=$2 snapshot=$3 fingerprint=$4 ci_runs=${5:-0} branch=${6:-} steps=${7:-1} code limit why state \
+    session start prompt notes= work=
   # Another loop may have run out of Claude usage since this round started.
   paused && return 0
   state=$(read_state "$id")
@@ -479,42 +494,55 @@ run_on_ticket() {
       printf '%s %s\n' "$id" "$(git rev-parse HEAD)" >"$(run_file)"
       work=$(restore_work "$id") && log "ticket $id: put back the unfinished work of its previous run ($work)"
     fi
-    if [[ -n $session ]]; then
-      start=--resume
-      previous=$(jq -r '.session.checkout // ""' <<<"$state")
-      prompt="This continues your previous run on ticket $id, which stopped before it finished: $(jq -r \
-        '.session.why // "the loop running it was stopped, for example by a restart"' <<<"$state"). Carry on from where \
-you left off rather than starting over, and check what is already done (on the ticket, the branch and the pull \
-request) before doing it again.$([[ -n $previous && $previous != "$PWD" ]] && printf '%s' "
-Earlier in this conversation you worked in $previous. This run is in $PWD, another checkout of the same \
-repository: work only in $PWD from now on, and leave $previous alone, as another run may be using it.")
-The loop's usual prompt follows.
-
-$prompt"
-    else
-      session=$(new_session_id)
-    fi
     if [[ -n $work ]]; then
-      prompt+="
+      notes="
 
 The previous run on this ticket didn't finish, and the loop kept its unfinished work: the repository is on $work, \
 with that run's uncommitted changes back in the working tree (see git status and git log). Carry on from there. If the \
 pull request's branch has moved on origin since, merge it in."
     elif [[ -n $branch && ${AGENT_LOOP_CLEAN:-0} == 1 && -z $(git branch --show-current) ]]; then
-      prompt+="
+      notes="
 
 The repository is checked out at origin/$branch (a detached HEAD, so create your branch from it), freshly updated \
 from origin with no local changes."
     elif [[ -n $branch ]]; then
-      prompt+="
+      notes="
 
-The repository is checked out on $branch, freshly updated from origin$(
-        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' " with no local changes")."
+The repository is checked out on $branch$(
+        [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]] && printf '%s' ", freshly updated from origin with no local changes")."
     fi
-    update_state "$id" '.session = ($v | fromjson) | del(.stopped)' \
-      "$(jq -nc --arg id "$session" --arg checkout "$PWD" '{id: $id, checkout: $checkout}')"
-    run_claude "$id" "$prompt" "$start" "$session"
-    code=$?
+    while :; do
+      if [[ -n $session ]]; then
+        start=--resume
+        prompt="$(resumed_prompt "$id" "$state")
+
+$task$notes"
+      else
+        start=--session-id
+        session=$(new_session_id)
+        prompt="$(intro)
+
+$task$( ((steps)) && unchecked_steps "$id")$notes"
+      fi
+      update_state "$id" '.session = ($v | fromjson) | del(.stopped) | .runStart = (now | floor)' \
+        "$(jq -nc --arg id "$session" --arg checkout "$PWD" --arg worker "$worker" \
+          '{id: $id, checkout: $checkout, worker: $worker}')"
+      run_claude "$id" "$prompt" "$start" "$session"
+      code=$?
+      # When the run started and ended, so that TRIAGE doesn't take the pull request comments it posted (without the
+      # marker) for feedback. The last 20 runs are kept.
+      update_state "$id" '.runs = ((.runs // []) + [[.runStart // (now | floor), (now | ceil)]])[-20:] | del(.runStart)'
+      # The session is gone (e.g. claude's history was cleared): run again at once as a new session, with the whole
+      # prompt. A session from another checkout isn't: claude --resume finds a session id in any project directory,
+      # and the resumed run works in this one (checked with Claude Code 2.1.304).
+      if [[ $code != 0 && $start == --resume && -z $claude_stopped && -z $claude_stop_requested &&
+        $claude_errors == *"No conversation found"* ]]; then
+        log "can't resume the session of the previous run on $id; starting a new one"
+        session=
+        continue
+      fi
+      break
+    done
     if [[ $code == 0 && ${AGENT_LOOP_CLEAN:-0} == 1 ]]; then rm -f "$(run_file)"; fi
     checkout "" >/dev/null # back to the default branch between runs, keeping the work of a run that didn't finish
   else
@@ -522,7 +550,11 @@ The repository is checked out on $branch, freshly updated from origin$(
     log "can't update the checkout for $id"
   fi
   if [[ $code == 0 ]]; then
-    write_state "$id" "$snapshot"
+    # The snapshot replaces the state, but the session stays for the next run to resume, and the run times stay for
+    # TRIAGE.
+    write_state "$id" "$(read_state "$id" | jq -c --argjson snapshot "$snapshot" \
+      '$snapshot + (. | {runs} | with_entries(select(.value != null))) +
+        if .session then {session: (.session | del(.why) + {done: true})} else {} end')"
     remove_scratch "$id"
     return 0
   fi
@@ -547,13 +579,6 @@ there is new feedback, such as a comment."
     update_state "$id" 'del(.session)'
     remove_scratch "$id"
     note "$id" "Stopped the agent's run on this ticket: $claude_stopped."
-    return 0
-  fi
-  if [[ $start == --resume && $claude_errors == *"No conversation found"* ]]; then
-    # The session is gone (e.g. claude's history was cleared): start a new one next round, and don't count a failure.
-    log "can't resume the session of the previous run on $id; starting a new one"
-    update_state "$id" 'del(.session)'
-    remove_scratch "$id"
     return 0
   fi
   log "claude exited with status $code on $id"
@@ -586,6 +611,33 @@ the agents may use together (app-ultrakanban.slice, see docs/agents.md)"
 new feedback such as a ticket comment retries it."
 }
 
+# What a run that resumes the ticket's session (the given state's `session`) is told before its task: what it
+# continues, its name if another worker ran the session before (e.g. a cheaper one fixing a merge conflict), and the
+# checkout to work in if the session ran in another one. The intro, the board's description and the checklist are
+# earlier in the conversation, so they aren't sent again.
+resumed_prompt() {
+  local id=$1 state=$2 previous was
+  previous=$(jq -r '.session.checkout // ""' <<<"$state")
+  was=$(jq -r '.session.worker // ""' <<<"$state")
+  if [[ $(jq -r '.session.done // false' <<<"$state") == true ]]; then
+    printf '%s' "This continues your conversation on ticket $id: your previous run on it finished, and the loop \
+started this one for what follows. What you were told earlier in this conversation still holds (the board's \
+conventions, the marker line, and your name unless this says otherwise); read the ticket or the pull request again \
+only for what you need."
+  else
+    printf '%s' "This continues your previous run on ticket $id, which stopped before it finished: $(jq -r \
+      '.session.why // "the loop running it was stopped, for example by a restart"' <<<"$state"). Carry on from where \
+you left off rather than starting over, and check what is already done (on the ticket, the branch and the pull \
+request) before doing it again."
+  fi
+  [[ -z $was || $was == "$worker" ]] || printf '%s' "
+Your name for this run (agent field and X-Actor header) is $worker, not $was: the loop runs it with $model at $effort \
+effort."
+  [[ -z $previous || $previous == "$PWD" ]] || printf '%s' "
+Earlier in this conversation you worked in $previous. This run is in $PWD, another checkout of the same repository: \
+work only in $PWD from now on, and leave $previous alone, as another run may be using it."
+}
+
 intro() {
   printf '%s' "Use the ultrakanban skill. KANBAN=$KANBAN, BOARD=$BOARD.
 Your name (agent field and X-Actor header): $worker. Use exactly this name: it says that you are the $AGENT agent
@@ -604,7 +656,7 @@ your own replies for feedback:
 $MARKER"
   # The board's description holds conventions for every ticket on it, so each run gets it rather than having to look.
   local description
-  description=$(get "/boards/$BOARD" | jq -r '.board.description // "" | gsub("^\\s+|\\s+$"; "")') || description=
+  description=$(board | jq -r '.board.description // "" | gsub("^\\s+|\\s+$"; "")') || description=
   [[ -z $description ]] || printf '%s' "
 
 The board's description (its conventions for every ticket on it; follow them unless the ticket says otherwise):

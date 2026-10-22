@@ -29,6 +29,7 @@ import { sql } from '../db.ts'
 import { type ActivityRow, toActivity } from './activity.ts'
 import { listBoards } from './boards.ts'
 import { agentDiskUsage, attachmentBytes } from './disk-usage.ts'
+import { compareAllRouting } from './routing.ts'
 import { type TagRow, toTag } from './tags.ts'
 import { WAITING_SINCE } from './tickets.ts'
 import { queryUsage } from './usage.ts'
@@ -338,7 +339,7 @@ export function getOverview(days: OverviewRange, at = new Date()): Overview {
   for (const run of usage) addWorkedOn(run.agent, run.boardId)
   for (const [agent, held] of holdings) for (const ticket of held) addWorkedOn(agent, ticket.boardId)
 
-  // A board's host agent runs as its worker name, or as that name with a ticket's own model and effort. Only the
+  // A board's host agent runs as its worker name, or as that name with a ticket's own model and effort or its fix runs'. Only the
   // board's default worker is listed while idle; the per-ticket variants show up once they have work, and only count
   // as the host agent of the boards they worked on: boards that leave the agent's name at its default share them.
   const ticketModels = new Map<string, string[]>()
@@ -353,7 +354,12 @@ export function getOverview(days: OverviewRange, at = new Date()): Overview {
     if (!board.agentEnabled) continue
     const worker = agentWorkerName(board)
     hostAgents.push(worker)
-    const models = new Set([board.agentModel ?? AGENT_DEFAULTS.model, ...(ticketModels.get(board.id) ?? [])])
+    const models = new Set([
+      board.agentModel ?? AGENT_DEFAULTS.model,
+      board.agentConflictModel ?? AGENT_DEFAULTS.conflictModel,
+      board.agentCiModel ?? AGENT_DEFAULTS.ciModel,
+      ...(ticketModels.get(board.id) ?? []),
+    ])
     for (const agentModel of models) {
       for (const agentEffort of AGENT_EFFORTS) {
         const name = agentWorkerName({ ...board, agentModel, agentEffort })
@@ -462,6 +468,7 @@ export function getOverview(days: OverviewRange, at = new Date()): Overview {
     completions: completions.sort((a, b) => a.at.localeCompare(b.at)),
     usage,
     tickets: ticketUsage,
+    routing: compareAllRouting(),
     recent,
   }
 }

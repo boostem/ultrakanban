@@ -38,6 +38,10 @@ its comments, attach screenshots, submit the pull request, and answer review fee
 `~/.claude/skills/ultrakanban/` to use it from any project. It also sets the rule that keeps context small:
 **one ticket per agent, one agent at a time** — finish a ticket, then start a fresh agent for the next.
 
+The agent loop doesn't put all of `SKILL.md` in its runs' system prompt: it uses `WORKER.md` beside it, a shorter
+version with only plan, checklist, review and feedback (no filing tickets, epics or splitting), which saves about
+3k tokens per turn. `SKILL.md` stays for interactive use and for boards with `agentAllSkills` on.
+
 Also: claim/release specific tickets, move to a column/position, comment, edit with optimistic concurrency
 (`ifVersion`), filter tickets, and subscribe to `GET /api/events`.
 
@@ -194,7 +198,8 @@ create one on GitHub with the server's login and link it) and switch on
 ([`scripts/agent-supervisor.sh`](../scripts/agent-supervisor.sh)) checks the boards every 30 seconds and keeps one
 `ultrakanban-agent@<board>` unit running per enabled board. It stops the loop when the board is switched off or
 deleted, and systemd restarts a loop that dies, with backoff up to 15 minutes. Each board gets its own clone,
-made with `gh repo clone`, under `~/.local/share/ultrakanban-agent/boards/<board>/repo`; your own working copies
+made with `gh repo clone`, under `~/.local/share/ultrakanban-agent/boards/<board>/repo` (when the repository is a fork,
+gh there is pointed at it rather than at its parent, so pull requests go to the fork); your own working copies
 are never touched. Before every run the loop fetches and checks out the default branch (detached, so create a branch
 from it) or, for feedback on a pull request, its branch, with no local changes, and goes back to the default branch
 afterwards. Logs: `journalctl --user -u ultrakanban-agent -u 'ultrakanban-agent@*' -f`.
@@ -223,6 +228,10 @@ directory. The directory is removed when the ticket's run finishes, and kept whe
 resumed. Directories no run has used for 3 days are removed too. Every run's processes carry an `ULTRAKANBAN_RUN`
 marker in their environment. When the run ends, the loop stops whatever still has the marker, such as a dev server
 started in the background, so nothing it started keeps holding memory.
+
+**Max turns.** The board's **Max turns per run** setting (`agentMaxTurns`) caps how many turns one `claude -p` run may
+take; the loop passes it as `--max-turns`. Without it a run is limited only by `TICKET_TIMEOUT`. A run that hits the cap
+ends like any other unfinished run and is retried up to `MAX_ATTEMPTS` times.
 
 **Parallel runs.** By default a board's agent runs one `claude -p` at a time. The board's **Parallel runs** setting
 (`agentConcurrency`, up to 8) lets it work that many tickets at once: the unit then runs that many loops, the first in
@@ -280,13 +289,19 @@ answers and posts a revised one, and waits again. Move the ticket back to Backlo
 
 **Names.** The board's **Agent name** (default `claude`) names the loop, which controls the work; its notes on
 tickets come from `<agent>-loop`. The runs it starts claim tickets as `<agent>/<model>/<effort>`, from the board's
-**Model** (default `opus`) and **Effort** (default `medium`) settings, which the loop passes to `claude`. So the board
+**Model** (default `opus`; aliases `fable`, `opus`, `sonnet`, `haiku`) and **Effort** (default `medium`) settings, which the loop passes to `claude`. So the board
 always shows which model and effort did the work, e.g. `claude/claude-opus-5-5/high`; a full model name keeps
 model versions apart. A ticket can ask for its own model and effort (**Agent model** and **Agent effort** in the
 ticket's properties, shown while the board's agent is on), e.g. `sonnet` for copy changes or `high` for a hard bug;
-tickets that don't use the board's. Agents that file tickets pick a model and effort for each one from how hard it
-looks (the skill's "Creating tickets" section has the guide). When you change the model or effort, the loop
-reassigns each ticket it holds to the new name before its next run on it. Agents you run yourself should follow the same pattern (see the skill).
+tickets that don't use the board's, or on a board that routes with Jev in `on` mode, the setting the claim routes them
+to (`routed`, see [docs/API.md](API.md#routing)), which their runs on feedback keep. Agents that file tickets pick a model and effort for each one from how hard it
+looks (the skill's "Creating tickets" section has the guide). Runs the loop starts only to fix merge conflicts, or only
+to fix failing CI (and any conflicts with it), use the board's **Conflict fix model**/**effort**
+(`agentConflictModel`/`agentConflictEffort`) or **CI fix model**/**effort** (`agentCiModel`/`agentCiEffort`) instead,
+`sonnet` at `medium` by default, whatever the ticket's: merging the base branch or fixing a check rarely needs the
+model the ticket was worked with. A run that also hands over someone's comment, review or move, or carries on a run
+that didn't finish, keeps the ticket's setting. When you change the model or effort, the loop
+lets the runs in progress finish, starts again with the new setting and reassigns each ticket it holds to the new name before its next run on it. Agents you run yourself should follow the same pattern (see the skill).
 
 Running the services on the host, not in the containers, is deliberate: the agents use your `claude` login, your
 `gh` auth and git.
@@ -297,7 +312,9 @@ that ran and failed, merge conflicts, or someone moving the ticket back into In 
 ask for more work). The prompt lists exactly what is new, and every prompt includes the board's description (Board
 settings), so put conventions for all of the board's tickets there. Bots and the agent's own replies
 don't count: the agent posts from the same GitHub account as you, so the skill makes it end every pull request
-comment with `<!-- ultrakanban:<agent> -->`, which the loop ignores. A pull request closed without merging moves
+comment with `<!-- ultrakanban:<agent> -->`, which the loop ignores. Pull request comments and reviews posted while
+one of the agent's runs on the ticket was going don't count either, in case the agent left the marker out (so one you
+post during a run doesn't start a new one: say it on the ticket instead). A pull request closed without merging moves
 its ticket to the `Cancelled` column (`CANCELLED_COLUMN`; add it to the board, the loop won't fall back to Todo)
 and unassigns it, so it is never picked up again. When none of its tickets needs work, it claims a new Todo ticket,
 and when there is nothing to do at all it waits `IDLE_SECONDS` (60 under the supervisor), or until the board wakes it
@@ -355,12 +372,20 @@ is handed over again, never skipped. As a run is only handed what was there when
 the agent to read the ticket's activity and the pull request's comments again just before it submits the ticket or
 posts its closing comment, so its summary doesn't skip a comment that came in while it worked.
 
+To spare GitHub's API rate limit, each round lists the open pull requests with one `gh pr list` call per repository,
+and reads a pull request's comments, reviews, inline comments and checks again only when it changed since the last
+read: a new `updatedAt` or head commit, or checks that were still running. What it read last is kept next to the
+watermark and used for at most `PR_RECHECK_SECONDS` (default 600), which catches what doesn't change `updatedAt`, such
+as a re-run check.
+
 CI failing for reasons other than the code can't make it loop. A failing check counts once per commit and check
 name, so re-running CI doesn't start a run. Checks that never ran or failed around the code (`startup_failure`,
 `action_required`, `timed_out`, billing or spending-limit messages, jobs where no step failed) never start a run;
 the loop leaves one ticket note per commit saying CI isn't running. Cancelled, skipped and neutral checks are
 ignored. On top of that, after `MAX_CI_RUNS` (default 2) runs in a row started only by CI, it stops starting CI runs
-for the ticket, with a note, until someone comments. And the agent is told not to push anything when a failure
+for the ticket, with a note, until someone comments. Merge conflicts work the same way: a pull request that stays in
+conflict starts a run each time the base branch moves, so after `MAX_CONFLICT_RUNS` (default 2) runs in a row started
+only by conflicts, the loop stops starting them, with a note, until someone comments. And the agent is told not to push anything when a failure
 isn't from the code.
 
 A failed run saves nothing and is retried with backoff (`RETRY_SECONDS`, doubling, up to `MAX_ATTEMPTS` in a row,
@@ -371,12 +396,28 @@ limits used up, if that is sooner (as when you reset your usage on claude.ai or 
 the board's report every `USAGE_CHECK_SECONDS` (default 60), and the supervisor reads the usage every
 `CLAUDE_USAGE_SECONDS` (default 300), so it picks back up within a few minutes.
 
-Runs that don't finish pick up where they left off. Each run is a `claude` session whose id the loop keeps with the
-ticket until the run ends. When a run is cut short by the usage limit, or by the loop stopping (restarting the service,
-changing the board's agent settings, a reboot or a crash), the ticket's next run resumes that session with
-`claude --resume`, so it still knows what it read, decided and did, even when another of the board's loops picks it
-up. (A run that failed or timed out gets a new session instead, since resuming it would likely fail the same way.) The
-work such a run left in the checkout is kept too: before the loop cleans a checkout it saves an unfinished run's
+A ticket's runs carry on one conversation. Each run is a `claude` session whose id the loop keeps with the ticket,
+and the ticket's next run resumes it with `claude --resume`, so it still knows what it read, decided and did, even
+when another of the board's loops picks it up:
+
+- **After a run that finished**, such as the one that posted a plan for approval or submitted the ticket for review,
+  the run for the approval and each run for review feedback continue its conversation instead of reading the ticket
+  and exploring the code again.
+- **Runs that don't finish** pick up where they left off: a run cut short by the usage limit, or by the loop stopping
+  (restarting the service, changing the board's agent settings, a reboot or a crash), is resumed and told why it
+  stopped.
+- **A run that failed or timed out** drops its session, so the retry starts a new one, since resuming it would likely
+  fail the same way. So does a run whose ticket was taken away.
+
+Only a new session gets the whole prompt: the loop's instructions, the board's description, the task and the ticket's
+unchecked checklist steps. A resumed run already has those earlier in its conversation, so it gets only what is new:
+a line saying what it continues, then the feedback the loop started it for (or, for a run that didn't finish, its task
+again). If another model or effort runs it this time (e.g. the board's cheaper setting for merge conflicts or failing
+CI), it is told its name for this run; if it runs in another checkout than before, it is told to work only there. When
+the session can't be resumed (claude answers "No conversation found", e.g. because its history was cleared or it ran
+in a checkout claude doesn't look in), the loop starts the run again at once as a new session with the whole prompt.
+
+The work such a run left in the checkout is kept too: before the loop cleans a checkout it saves an unfinished run's
 branch, local commits and uncommitted changes, untracked files included, under `refs/ultrakanban/work/<ticket>` in
 the board's clone, and puts them back before the ticket's next run, telling the agent. Worktrees removed when
 **Parallel runs** goes down have theirs saved first. Other settings are listed at the top of the script. It needs `curl`, `jq`,

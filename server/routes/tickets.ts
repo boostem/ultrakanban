@@ -9,6 +9,7 @@ import {
   commentSchema,
   createSubticketSchema,
   heartbeatSchema,
+  listActivityQuerySchema,
   listRunsQuerySchema,
   mergeTicketSchema,
   moveTicketSchema,
@@ -25,6 +26,7 @@ import { newId, transaction } from '../db.ts'
 import { badRequest, gitHubFailure, HttpError } from '../errors.ts'
 import type { GitHubClient } from '../github.ts'
 import { actorOf, errorBody, readJson } from '../http.ts'
+import { routeClaim, routeRun } from '../jev-routing.ts'
 import { listActivity } from '../store/activity.ts'
 import { createAttachment, listAttachments } from '../store/attachments.ts'
 import {
@@ -72,6 +74,7 @@ const tooLargeMessage = `Attachments can be at most ${MAX_ATTACHMENT_BYTES / 102
 export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifier }: AppServices) =>
   new Hono()
     .get('/:ticketId', (c) => c.json(getTicket(c.req.param('ticketId'))))
+    .get('/:ticketId/route', async (c) => c.json({ routed: await routeRun(getTicket(c.req.param('ticketId'))) }))
     .patch('/:ticketId', async (c) => {
       const input = await readJson(c, updateTicketSchema)
       const ticket = transaction(() => updateTicket(c.req.param('ticketId'), input, actorOf(c)))
@@ -175,7 +178,9 @@ export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifi
     })
     .post('/:ticketId/claim', async (c) => {
       const input = await readJson(c, claimTicketSchema)
-      return c.json(transaction(() => claimTicket(c.req.param('ticketId'), input)))
+      const ticket = transaction(() => claimTicket(c.req.param('ticketId'), input))
+      const routed = await routeClaim(ticket)
+      return c.json(routed ? { ...ticket, routed } : ticket)
     })
     .post('/:ticketId/release', async (c) => {
       const input = await readJson(c, releaseTicketSchema)
@@ -184,8 +189,7 @@ export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifi
     .post('/:ticketId/heartbeat', async (c) => {
       // The body is optional: a heartbeat without one keeps the run's step.
       const input = (await c.req.text()) ? await readJson(c, heartbeatSchema) : {}
-      recordHeartbeat(c.req.param('ticketId'), input)
-      return c.body(null, 204)
+      return c.json(recordHeartbeat(c.req.param('ticketId'), input))
     })
     .delete('/:ticketId/heartbeat', (c) => {
       endRun(c.req.param('ticketId'))
@@ -195,7 +199,8 @@ export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifi
     .post('/:ticketId/stop', (c) => c.json(transaction(() => requestStop(c.req.param('ticketId'), actorOf(c)))))
     .get('/:ticketId/activity', (c) => {
       const ticket = getTicket(c.req.param('ticketId'))
-      return c.json(listActivity(ticket.id))
+      const query = listActivityQuerySchema.parse({ afterId: c.req.query('afterId'), type: c.req.queries('type') })
+      return c.json(listActivity(ticket.id, query))
     })
     .get('/:ticketId/usage', (c) => c.json(listUsage(c.req.param('ticketId'))))
     .post('/:ticketId/usage', async (c) => {

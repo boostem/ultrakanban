@@ -12,6 +12,7 @@ import {
   createGitHubRepoSchema,
   createTagSchema,
   createTicketSchema,
+  jevSuggestionSchema,
   listTicketsQuerySchema,
   mergeRunSchema,
   recordUsageSchema,
@@ -21,6 +22,8 @@ import { transaction } from '../db.ts'
 import { gitHubFailure, HttpError } from '../errors.ts'
 import { wake } from '../events.ts'
 import { actorOf, readJson } from '../http.ts'
+import { routeClaim, suggestWithJev } from '../jev-routing.ts'
+import { typesafeKey } from '../typesafe.ts'
 import type { AppServices } from '../app.ts'
 import { createBoard, deleteBoard, getBoard, getBoardDetail, listBoards, updateBoard } from '../store/boards.ts'
 import { recordClaim } from '../store/agent-services.ts'
@@ -33,10 +36,12 @@ import {
   bulkUpdateTickets,
   claimNextTicket,
   createTicket,
+  compactTicket,
   getTicketByNumber,
   listTickets,
   requestConflictFixes,
 } from '../store/tickets.ts'
+import { compareRouting } from '../store/routing.ts'
 import { suggestAgent } from '../store/suggestions.ts'
 import { exportBoard, importBoard } from '../store/transfer.ts'
 import { listBoardUsage, recordBoardUsage } from '../store/usage.ts'
@@ -59,8 +64,12 @@ export const boardRoutes = ({ pullRequests, mergeQueue, attachmentFiles }: AppSe
       )
     })
     .get('/:boardId', (c) => {
-      const query = boardDetailQuerySchema.parse({ archived: c.req.query('archived') })
-      return c.json(getBoardDetail(c.req.param('boardId'), query))
+      const query = boardDetailQuerySchema.parse({
+        archived: c.req.query('archived'),
+        compact: c.req.query('compact'),
+      })
+      const detail = getBoardDetail(c.req.param('boardId'), query)
+      return c.json(query.compact ? { ...detail, tickets: detail.tickets.map(compactTicket) } : detail)
     })
     .patch('/:boardId', async (c) => {
       const input = await readJson(c, updateBoardSchema)
@@ -122,8 +131,10 @@ export const boardRoutes = ({ pullRequests, mergeQueue, attachmentFiles }: AppSe
         priority: c.req.queries('priority'),
         epic: c.req.query('epic'),
         q: c.req.query('q'),
+        compact: c.req.query('compact'),
       })
-      return c.json(listTickets(boardId, query))
+      const tickets = listTickets(boardId, query)
+      return c.json(query.compact ? tickets.map(compactTicket) : tickets)
     })
     .get('/:boardId/tickets/:number{[0-9]+}', (c) =>
       c.json(getTicketByNumber(c.req.param('boardId'), Number(c.req.param('number')))),
@@ -146,7 +157,8 @@ export const boardRoutes = ({ pullRequests, mergeQueue, attachmentFiles }: AppSe
       try {
         const ticket = transaction(() => claimNextTicket(boardId, input))
         transaction(() => recordClaim(boardId, null))
-        return c.json(ticket)
+        const routed = await routeClaim(ticket)
+        return c.json(routed ? { ...ticket, routed } : ticket)
       } catch (error) {
         // Nothing to do, or the usage reserve holding agents back on purpose (the overview says so), isn't a failure.
         const waiting =
@@ -178,7 +190,19 @@ export const boardRoutes = ({ pullRequests, mergeQueue, attachmentFiles }: AppSe
         tag: c.req.queries('tag'),
         steps: c.req.query('steps'),
       })
-      return c.json(suggestAgent(c.req.param('boardId'), query))
+      const boardId = c.req.param('boardId')
+      return c.json({ ...suggestAgent(boardId, query), routing: compareRouting([boardId]) })
+    })
+    .post('/:boardId/jev-suggestion', async (c) => {
+      const boardId = c.req.param('boardId')
+      getBoard(boardId)
+      const draft = await readJson(c, jevSuggestionSchema)
+      if (!typesafeKey()) {
+        throw new HttpError(409, 'jev_unavailable', 'Jev needs a TypeSafe key; set one up in the setup page')
+      }
+      const suggestion = await suggestWithJev(boardId, draft)
+      if (!suggestion) throw new HttpError(502, 'jev_failed', 'Jev could not be asked, or its answer did not fit')
+      return c.json(suggestion)
     })
     .get('/:boardId/usage', (c) => c.json(listBoardUsage(c.req.param('boardId'))))
     .post('/:boardId/usage', async (c) => {

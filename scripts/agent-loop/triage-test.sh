@@ -7,11 +7,14 @@ source "$here/triage.sh"
 
 fail=0
 # run <name> <expected item keys> <activity json> <issue json> <reviews json> <inline json> [state json]
+#   [local pull request comments json]
 run() {
-  local got
+  local got pr=null
+  # Comments on a local pull request come with that pull request, in gh pr view's shape.
+  if [ -n "${8:-}" ]; then pr='{"state":"OPEN","headRefName":"b","baseRefName":"main","url":"http://k/b/x/pr/1"}'; fi
   got=$(jq -cs --arg agent me --arg loop loop --arg marker '<!-- m -->' --arg working 'In progress' \
     --argjson now 1000 --argjson retry 60 --argjson max 3 --argjson maxci 3 --argjson maxconflict 3 "$TRIAGE" \
-    <<<"$3 null null $4 $5 $6 ${7:-{\}}" | jq -r '.fingerprint')
+    <<<"$3 $pr null $4 $5 $6 ${8:-[]} ${7:-{\}}" | jq -r '.fingerprint')
   if [ "$got" = "$2" ]; then echo "ok   $1"; else echo "FAIL $1: expected '$2', got '$got'"; fail=1; fi
 }
 user='"user":{"login":"bob","type":"User"}'
@@ -42,9 +45,20 @@ run "review during a run" "" "[]" "[]" "$(at 2 submitted_at 2026-01-01T10:00:00Z
 run "inline comment during a run" "" "[]" "[]" "[]" "$(at 4 created_at 2026-01-01T10:10:00.123Z)" "$runs"
 run "inline comment after a run" "c4" "[]" "[]" "[]" "$(at 4 created_at 2026-01-01T10:10:01Z)" "$runs"
 run "ticket comment during a run" "t1" "$(c 'Use the other endpoint instead' | sed 's/"id"/"createdAt":"2026-01-01T10:05:00Z","id"/')" "[]" "[]" "[]" "$runs"
+# Comments on a local pull request (on the board): its own comments are told apart by their author.
+l() { echo "[{\"id\":\"a1\",\"author\":\"$1\",\"body\":\"$2\"}]"; }
+run "local PR comment real" "l1" "[]" "[]" "[]" "[]" "{}" "$(l bob 'Please also handle the empty case')"
+run "local PR comment thanks" "" "[]" "[]" "[]" "[]" "{}" "$(l bob 'Thanks!')"
+run "local PR comment by the agent" "" "[]" "[]" "[]" "[]" "{}" "$(l me/sonnet 'Renamed it')"
+run "local PR comment with the marker" "" "[]" "[]" "[]" "[]" "{}" "$(l bob 'Done <!-- m -->')"
+run "local PR comment already handed over" "" "[]" "[]" "[]" "[]" '{"local":{"pr":"http://k/b/x/pr/1","seen":1}}' \
+  "$(l bob 'Please also handle the empty case')"
+run "local PR comment on another pull request" "l1" "[]" "[]" "[]" "[]" '{"local":{"pr":"http://k/b/x/pr/9","seen":1}}' \
+  "$(l bob 'Please also handle the empty case')"
+
 got=$(jq -cs --arg agent me --arg loop loop --arg marker '<!-- m -->' --arg working 'In progress' \
   --argjson now 1000 --argjson retry 60 --argjson max 3 --argjson maxci 3 --argjson maxconflict 3 "$TRIAGE" \
-  <<<"[] null null [] [] [] $runs" | jq -c '.snapshot.runs')
+  <<<"[] null null [] [] [] [] $runs" | jq -c '.snapshot.runs')
 if [ "$got" = '[[1767261600,1767262200]]' ]; then echo "ok   snapshot keeps the runs"; else
   echo "FAIL snapshot keeps the runs: got '$got'"; fail=1; fi
 exit $fail

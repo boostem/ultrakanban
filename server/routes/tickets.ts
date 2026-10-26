@@ -9,6 +9,7 @@ import {
   commentSchema,
   createSubticketSchema,
   heartbeatSchema,
+  listActivityQuerySchema,
   listRunsQuerySchema,
   mergeTicketSchema,
   moveTicketSchema,
@@ -188,8 +189,7 @@ export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifi
     .post('/:ticketId/heartbeat', async (c) => {
       // The body is optional: a heartbeat without one keeps the run's step.
       const input = (await c.req.text()) ? await readJson(c, heartbeatSchema) : {}
-      recordHeartbeat(c.req.param('ticketId'), input)
-      return c.body(null, 204)
+      return c.json(recordHeartbeat(c.req.param('ticketId'), input))
     })
     .delete('/:ticketId/heartbeat', (c) => {
       endRun(c.req.param('ticketId'))
@@ -199,7 +199,8 @@ export const ticketRoutes = ({ pullRequests, mergeQueue, attachmentFiles, notifi
     .post('/:ticketId/stop', (c) => c.json(transaction(() => requestStop(c.req.param('ticketId'), actorOf(c)))))
     .get('/:ticketId/activity', (c) => {
       const ticket = getTicket(c.req.param('ticketId'))
-      return c.json(listActivity(ticket.id))
+      const query = listActivityQuerySchema.parse({ afterId: c.req.query('afterId'), type: c.req.queries('type') })
+      return c.json(listActivity(ticket.id, query))
     })
     .get('/:ticketId/usage', (c) => c.json(listUsage(c.req.param('ticketId'))))
     .post('/:ticketId/usage', async (c) => {

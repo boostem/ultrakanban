@@ -39,6 +39,12 @@ export const AGENT_DEFAULTS = {
   effort: 'medium',
   concurrency: 1,
   conflictConcurrency: 2,
+  /** Model and effort for runs that only fix merge conflicts (`agentConflictModel`/`agentConflictEffort`). */
+  conflictModel: 'sonnet',
+  conflictEffort: 'medium',
+  /** Model and effort for runs that only fix failing CI (`agentCiModel`/`agentCiEffort`). */
+  ciModel: 'sonnet',
+  ciEffort: 'medium',
 } as const
 /** Most runs a board's agent can work at once; each one needs its own git worktree and counts against Claude usage. */
 export const AGENT_MAX_CONCURRENCY = 8
@@ -394,6 +400,16 @@ export interface BoardSummary {
    * causes in the others are fixed side by side. 0 for none; 2 when not set.
    */
   agentConflictConcurrency: number | null
+  /**
+   * Model and effort level for runs started only to fix merge conflicts, whatever the ticket's own setting: such runs
+   * merge the base branch and rarely need the ticket's model. Runs that also hand over human feedback keep the ticket's.
+   * `sonnet` and `medium` when not set.
+   */
+  agentConflictModel: string | null
+  agentConflictEffort: AgentEffort | null
+  /** Model and effort level for runs started only to fix failing CI (and any merge conflicts); as for conflicts. */
+  agentCiModel: string | null
+  agentCiEffort: AgentEffort | null
   /** Whether the agent also takes tickets from the Backlog column once the Todo column has none left. */
   agentBacklog: boolean
   /**
@@ -578,6 +594,30 @@ export interface Ticket {
 }
 
 /**
+ * A ticket as `?compact=true` lists it: what an agent needs to pick a ticket and see where it stands, without its
+ * description, usage or run. Fetch the ticket itself for the rest.
+ */
+export type CompactTicket = Pick<
+  Ticket,
+  | 'id'
+  | 'number'
+  | 'columnId'
+  | 'title'
+  | 'priority'
+  | 'assignee'
+  | 'tagIds'
+  | 'epicId'
+  | 'parentId'
+  | 'version'
+  | 'estimate'
+  | 'approval'
+  | 'waitingSince'
+  | 'archived'
+  | 'subtickets'
+  | 'commentCount'
+> & { pullRequest: Pick<PullRequest, 'url' | 'state' | 'checks' | 'conflicts'> | null }
+
+/**
  * Why the board's auto-merge (`BoardSummary.autoMerge`) isn't merging a ticket's pull request yet, as its latest round
  * found: what keeps it from being ready, or that merging it failed. Auto-merge looks again every minute.
  */
@@ -697,6 +737,7 @@ export interface BoardDetail {
   tags: Tag[]
   /** Oldest first. */
   epics: Epic[]
+  /** `CompactTicket`s instead with `?compact=true`. */
   tickets: Ticket[]
   /** Archived tickets left out of `tickets`; 0 when they were asked for. */
   archivedCount: number
@@ -719,6 +760,21 @@ export type Activity =
   | ActivityBase<'pull_request', { url: string; event: 'linked' | 'unlinked' | Exclude<PullRequestState, 'unknown'> }>
 
 export type ActivityType = Activity['type']
+
+export const ACTIVITY_TYPES = [
+  'created',
+  'updated',
+  'checked',
+  'moved',
+  'claimed',
+  'released',
+  'comment',
+  'plan',
+  'approved',
+  'stopped',
+  'attachment',
+  'pull_request',
+] as const satisfies readonly ActivityType[]
 
 /** Tokens an agent used, split the way Claude reports them. */
 export interface TokenCounts {

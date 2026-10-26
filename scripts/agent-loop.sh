@@ -7,6 +7,8 @@
 # claude/opus/high. The loop passes that model and effort to claude, so the name always says what did the work.
 # A ticket can ask for its own model and effort level (its agentModel and agentEffort); tickets that don't are worked
 # at the setting the board routes them to, when it routes with Jev (the claim's routed), else with MODEL at EFFORT.
+# Runs started only to fix merge conflicts, or only to fix failing CI, use the board's setting for those instead
+# (agentConflictModel/agentConflictEffort and agentCiModel/agentCiEffort, sonnet at medium when not set).
 # Tickets held under another of the agent's names (another model or effort, or the bare agent name) are its own too:
 # before a run on one, the loop reassigns it to the current worker.
 #
@@ -96,9 +98,12 @@
 # claims nothing until it lifts. Tickets the agent holds still get runs for their feedback, so work in progress and in
 # review isn't left halfway.
 #
-# Runs that don't finish are resumed, not started over. Each run is a claude session, and a run cut short by the
-# usage limit or by the loop stopping (a restart of the service or the machine, a crash) is continued in that same
-# session (claude --resume), so it keeps everything it already knew and did. With AGENT_LOOP_CLEAN=1, the work such a
+# A ticket's runs carry on one claude session (claude --resume), so each keeps everything the earlier ones knew and
+# did: the run after a plan approval and each run for review feedback continue the conversation of the run before,
+# and get only the new feedback rather than the whole prompt again. Runs that don't finish are resumed, not started
+# over: a run cut short by the usage limit or by the loop stopping (a restart of the service or the machine, a crash)
+# is continued in that same session. A run that failed starts a new one, and so does a run whose session can't be
+# resumed (see run_on_ticket in agent-loop/run.sh). With AGENT_LOOP_CLEAN=1, the work such a
 # run (or a failed one) left in the checkout isn't discarded either: the loop keeps its commits and uncommitted
 # changes under refs/ultrakanban/work/<ticket> and puts them back before the ticket's next run, in whichever checkout.
 #
@@ -148,6 +153,11 @@
 #                       back before the time claude's limit message gave (default: 60)
 #   MAX_ATTEMPTS        failed runs in a row before waiting for new feedback (default: 3)
 #   MAX_CI_RUNS         runs in a row started only by failing CI, with no human feedback between (default: 2)
+#   PR_RECHECK_SECONDS  longest the loop goes on using what it last read of an open pull request (its comments, reviews,
+#                       inline comments and checks) while the pull request looks unchanged: same updatedAt and head
+#                       commit, and no checks still running. Each round lists the open pull requests with one call per
+#                       repository and reads GitHub again only for the ones that changed; this catches what doesn't
+#                       change updatedAt, such as a re-run check (default: 600)
 #   MAX_CONFLICT_RUNS   runs in a row started only by merge conflicts, with no human feedback between (default: 2)
 #   CLAIM_LIMIT         most new tickets claimed whose first run hasn't finished yet (it is going, failed or stopped),
 #                       across the loops sharing STATE_DIR: no loop claims another while that many are pending, so
@@ -218,6 +228,7 @@ RETRY_SECONDS=${RETRY_SECONDS:-600}
 USAGE_CHECK_SECONDS=${USAGE_CHECK_SECONDS:-60}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
 MAX_CI_RUNS=${MAX_CI_RUNS:-2}
+PR_RECHECK_SECONDS=${PR_RECHECK_SECONDS:-600}
 MAX_CONFLICT_RUNS=${MAX_CONFLICT_RUNS:-2}
 MAX_BUILD_GB=${MAX_BUILD_GB:-20}
 CLAIM_LIMIT=${CLAIM_LIMIT:-1}
@@ -251,7 +262,7 @@ fi
 DOCKER_IMAGE=${DOCKER_IMAGE:-ultrakanban-agent}
 export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-10000}
 export BASH_MAX_OUTPUT_LENGTH=${BASH_MAX_OUTPUT_LENGTH:-15000}
-mkdir -p "$STATE_DIR" || exit 1
+mkdir -p "$STATE_DIR/github" || exit 1
 
 # The rest of the loop is split into parts by what they do, so that changing one means reading only that part.
 parts=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agent-loop
@@ -360,6 +371,7 @@ while true; do
     log "the agent scripts were updated; stopping to start again with the new ones"
     exit 75
   fi
+  refresh_board
   clear_requested_build_output
   handle_feedback || claim_next || idle "$IDLE_SECONDS"
 done

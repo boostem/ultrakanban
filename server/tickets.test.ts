@@ -262,6 +262,62 @@ describe('agent claiming', () => {
   })
 })
 
+describe('lean responses', () => {
+  test('lists compact tickets, without their description, on the board and the tickets list', async () => {
+    const ticket = await addTicket({ title: 'A', description: 'Long text', tags: ['bug'] })
+    const { body: board } = await call<BoardDetail>('GET', `/boards/${boardId}?compact=1`)
+    const { body: list } = await call<Record<string, unknown>[]>('GET', `/boards/${boardId}/tickets?compact=true`)
+
+    for (const compact of [board.tickets[0], list[0]] as Record<string, unknown>[]) {
+      assert.equal(compact.id, ticket.id)
+      assert.equal(compact.title, 'A')
+      assert.deepEqual(compact.tagIds, ticket.tagIds)
+      assert.equal(compact.version, ticket.version)
+      for (const left of ['description', 'usage', 'run', 'boardId']) assert.equal(left in compact, false, left)
+    }
+    assert.equal(board.columns.length > 0, true)
+    assert.equal((await call<Ticket[]>('GET', `/boards/${boardId}/tickets`)).body[0].description, 'Long text')
+  })
+
+  test('filters the tickets list by column and assignee', async () => {
+    const mine = await addTicket({ title: 'mine' })
+    await addTicket({ title: 'theirs' })
+    await addTicket({ title: 'doing', column: 'Doing' })
+    await call('POST', `/tickets/${mine.id}/claim`, { agent: 'alpha' })
+    const titles = async (query: string) =>
+      (await call<Ticket[]>('GET', `/boards/${boardId}/tickets?${query}`)).body.map((t) => t.title)
+
+    assert.deepEqual(await titles('column=Todo'), ['mine', 'theirs'])
+    assert.deepEqual(await titles('assignee=alpha'), ['mine'])
+    assert.deepEqual(await titles('column=Doing&assignee=alpha'), [])
+  })
+
+  test('lists only activity after an id, and of the given types', async () => {
+    const ticket = await addTicket({ title: 'A' })
+    await call('POST', `/tickets/${ticket.id}/comments`, { body: 'one' })
+    await call('POST', `/tickets/${ticket.id}/claim`, { agent: 'alpha' })
+    await call('POST', `/tickets/${ticket.id}/comments`, { body: 'two' })
+    const activity = async (query: string) =>
+      (await call<Activity[]>('GET', `/tickets/${ticket.id}/activity?${query}`)).body
+    const all = await activity('')
+
+    assert.deepEqual(
+      (await activity('type=comment')).map((entry) => entry.data),
+      [{ body: 'one' }, { body: 'two' }],
+    )
+    assert.deepEqual(
+      (await activity(`afterId=${all[1].id}`)).map((entry) => entry.type),
+      ['claimed', 'comment'],
+    )
+    assert.deepEqual(
+      (await activity(`afterId=${all[1].id}&type=comment&type=claimed`)).map((entry) => entry.type),
+      ['claimed', 'comment'],
+    )
+    assert.deepEqual(await activity(`afterId=${all.at(-1)!.id}`), [])
+    assert.equal((await call('GET', `/tickets/${ticket.id}/activity?type=nope`)).status, 400)
+  })
+})
+
 describe('idle tickets', () => {
   /** Runs `fn` with the clock moved forward by the given minutes. */
   async function later<T>(minutes: number, fn: () => Promise<T>) {
@@ -290,7 +346,7 @@ describe('idle tickets', () => {
 
     const minutes = AGENT_IDLE_MINUTES + 1
     const released = await later(minutes, async () => {
-      assert.equal((await call('POST', `/tickets/${running.id}/heartbeat`, undefined, 'alpha')).status, 204)
+      assert.equal((await call('POST', `/tickets/${running.id}/heartbeat`, undefined, 'alpha')).status, 200)
       await call('POST', `/tickets/${discussed.id}/comments`, { body: 'Still on it' }, 'alpha')
       const listed = await call<Ticket[]>('GET', `/columns/${column.id}/idle-tickets`)
       assert.deepEqual(
@@ -363,7 +419,7 @@ describe('idle tickets', () => {
 
     const later1 = await later(1, async () => {
       // Without a step, a heartbeat keeps the run's step, and nothing changes that boards need to show.
-      assert.equal((await call('POST', `/tickets/${ticket.id}/heartbeat`)).status, 204)
+      assert.equal((await call('POST', `/tickets/${ticket.id}/heartbeat`)).status, 200)
       return run()
     })
     assert.equal(later1?.startedAt, started?.startedAt)
@@ -435,11 +491,18 @@ describe('idle tickets', () => {
     assert.equal((await activity()).filter((item) => item.type === 'stopped').length, 1)
 
     // The run's heartbeats keep the request; its end clears it, and the next run starts without one.
-    await call('POST', `/tickets/${ticket.id}/heartbeat`, undefined, 'alpha')
+    const beat = await call<{ stopRequested: { at: string; by: string } | null }>(
+      'POST',
+      `/tickets/${ticket.id}/heartbeat`,
+      undefined,
+      'alpha',
+    )
+    assert.equal(beat.body.stopRequested?.by, 'person')
     assert.equal((await get()).run?.stopRequested?.by, 'person')
     await call('DELETE', `/tickets/${ticket.id}/heartbeat`, undefined, 'alpha')
     assert.equal((await get()).run, null)
-    await call('POST', `/tickets/${ticket.id}/heartbeat`, undefined, 'alpha')
+    const fresh = await call<{ stopRequested: null }>('POST', `/tickets/${ticket.id}/heartbeat`, undefined, 'alpha')
+    assert.equal(fresh.body.stopRequested, null)
     assert.equal((await get()).run?.stopRequested, null)
 
     assert.equal((await call('POST', '/tickets/missing/stop')).status, 404)

@@ -58,6 +58,19 @@ use_ticket_worker() {
   use_worker "$model" "$effort"
 }
 
+# Sets the worker for a run only to fix merge conflicts (trigger conflict) or failing CI (trigger ci): the board's
+# setting for those, from the conflict model, conflict effort, CI model and CI effort, tab-separated. Returns 1 for
+# any other run.
+use_fix_worker() {
+  local conflict_model conflict_effort ci_model ci_effort
+  IFS=$'\t' read -r conflict_model conflict_effort ci_model ci_effort <<<"$2"
+  case $1 in
+    conflict) use_worker "$conflict_model" "$conflict_effort" ;;
+    ci) use_worker "$ci_model" "$ci_effort" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Reassigns a ticket held under another of the agent's names (another model or effort, or the bare agent name) to
 # the worker set by use_worker, in one versioned update.
 adopt() {
@@ -72,19 +85,54 @@ adopt() {
   log "ticket #$number ($id): reassigned from $holder to $worker"
 }
 
+# What the loop reads of a pull request, from gh pr list or gh pr view.
+PR_FIELDS=state,updatedAt,mergeable,mergeStateStatus,headRefOid,headRefName,baseRefOid,baseRefName
+
+# Reads an open pull request's comments, reviews, inline comments and checks into issue, reviews, inline and ci. They
+# are kept in STATE_DIR/github/<ticket>.json and used again while the pull request (gh pr list or view) is unchanged:
+# same updatedAt and head commit, no checks still running, and read less than PR_RECHECK_SECONDS ago. Each of the
+# calls this spares costs GitHub API rate limit, several per pull request and round. Returns 1 if GitHub can't be read.
+read_pr_feedback() {
+  local id=$1 url=$2 repo=$3 number=$4 pr=$5 file sha cached now
+  file="$STATE_DIR/github/$id.json"
+  sha=$(jq -r .headRefOid <<<"$pr")
+  now=$(date +%s)
+  cached=$(jq -c --arg url "$url" --arg sha "$sha" --argjson pr "$pr" --argjson now "$now" \
+    --argjson max "$PR_RECHECK_SECONDS" 'select(.url == $url and .sha == $sha and $pr.updatedAt != null
+      and .updatedAt == $pr.updatedAt and .ci.pending == false and $now - .at < $max)' "$file" 2>/dev/null)
+  if [[ -n $cached ]]; then
+    issue=$(jq -c .issue <<<"$cached") reviews=$(jq -c .reviews <<<"$cached") inline=$(jq -c .inline <<<"$cached")
+    ci=$(jq -c .ci <<<"$cached")
+    return 0
+  fi
+  issue=$(gh_list "repos/$repo/issues/$number/comments?per_page=100") &&
+    reviews=$(gh_list "repos/$repo/pulls/$number/reviews?per_page=100") &&
+    inline=$(gh_list "repos/$repo/pulls/$number/comments?per_page=100") ||
+    { log "can't read the comments on $url"; return 1; }
+  ci=$(ci_status "$repo" "$sha") || { log "can't read the checks on $url"; return 1; }
+  printf '%s\n' "$issue" "$reviews" "$inline" "$ci" |
+    jq -cs --arg url "$url" --arg sha "$sha" --argjson pr "$pr" --argjson now "$now" \
+      '{url: $url, sha: $sha, updatedAt: $pr.updatedAt, at: $now, issue: .[0], reviews: .[1], inline: .[2], ci: .[3]}' \
+      >"$file.tmp" && mv "$file.tmp" "$file" || rm -f "$file.tmp"
+}
+
 # Checks the tickets the agent holds and handles the first one that needs work. Returns 1 if none did. A conflict loop
 # (CONFLICTS_ONLY) only handles tickets in the review column whose pull request has merge conflicts, and the human
 # feedback on the ticket it last ran (its `followup`) that came in during that run: left to the loops that work tickets,
 # that feedback could wait hours for one of them to be free.
 handle_feedback() {
   local board review cancelled idle tickets file id number column holder version ticket_model ticket_effort pr_url repo pr_number \
-    queued approval conflicts pr branch ci issue reviews inline activity state triage items ci_note next
+    queued approval conflicts pr branch listed open_prs list after ci issue reviews inline activity state triage items \
+    ci_note next fix_runs
   claim_lock -s
-  board=$(get "/boards/$BOARD") || { claim_unlock; log "can't read board $BOARD"; return 1; }
+  board=$(board) || { claim_unlock; log "can't read board $BOARD"; return 1; }
   review=$(jq -r '.board.reviewColumnId // ""' <<<"$board")
   cancelled=$(jq -r --arg name "$CANCELLED_COLUMN" \
     '[.columns[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id][0] // ""' <<<"$board")
   idle=$(idle_columns "$board") || { claim_unlock; log "can't read the columns of board $BOARD"; return 1; }
+  # The model and effort for runs only to fix merge conflicts, then for those only to fix failing CI.
+  fix_runs=$(jq -r '.board | [.agentConflictModel // "sonnet", .agentConflictEffort // "medium",
+    .agentCiModel // "sonnet", .agentCiEffort // "medium"] | @tsv' <<<"$board")
   tickets=$(jq -r --arg agent "$AGENT" --arg cancelled "$cancelled" --argjson idle "$idle" \
     '(.board.doneColumnId // "") as $done
     | .tickets[] | select(.assignee | . != null and (. == $agent or startswith($agent + "/")))
@@ -97,13 +145,13 @@ handle_feedback() {
   board=
 
   # Forget tickets the agent no longer holds, and their unfinished work.
-  for file in "$STATE_DIR"/*.json "$STATE_DIR"/*.lock; do
+  for file in "$STATE_DIR"/*.json "$STATE_DIR"/*.lock "$STATE_DIR"/github/*.json; do
     [[ -e $file && $file != */claim.lock ]] || continue
     id=${file##*/}
     id=${id%.*}
     [[ $'\n'$tickets == *$'\n'"$id"$'\t'* ]] && continue
     rm -f "$file"
-    if [[ $file == *.json ]]; then remove_scratch "$id"; fi
+    if [[ $file == "$STATE_DIR/$id.json" ]]; then remove_scratch "$id"; fi
   done
   if [[ ${AGENT_LOOP_CLEAN:-0} == 1 ]]; then
     for id in $(git for-each-ref --format='%(refname:lstrip=3)' refs/ultrakanban/work/); do
@@ -112,6 +160,9 @@ handle_feedback() {
   fi
   claim_unlock
 
+  # The open pull requests of the repositories the tickets' pull requests are in, listed once per repository as they
+  # come up: {repo: {number: pull request}}. One that isn't listed (closed, merged, or the list failed) is read alone.
+  listed=$'\n' open_prs='{}'
   while IFS=$'\t' read -r -u 3 id number column holder version ticket_model ticket_effort pr_url repo pr_number queued \
     approval conflicts; do
     [[ -n $id ]] || continue
@@ -127,18 +178,20 @@ handle_feedback() {
     fi
     pr=null branch= ci=null issue='[]' reviews='[]' inline='[]'
     if [[ $pr_url != - ]]; then
-      pr=$(gh pr view "$pr_url" \
-        --json state,mergeable,mergeStateStatus,headRefOid,headRefName,baseRefOid,baseRefName </dev/null) ||
+      if [[ $repo != - && $listed != *$'\n'"$repo"$'\n'* ]]; then
+        listed+="$repo"$'\n'
+        list=$(gh pr list --repo "$repo" --state open --limit 1000 --json "number,$PR_FIELDS" </dev/null |
+          jq -c --arg repo "$repo" \
+            '{($repo): (map({key: (.number | tostring), value: del(.number)}) | from_entries)}') &&
+          open_prs=$(printf '%s\n' "$open_prs" "$list" | jq -cs add) || log "can't list the pull requests of $repo"
+      fi
+      pr=$(jq -c --arg repo "$repo" --arg number "$pr_number" '.[$repo][$number] // empty' <<<"$open_prs")
+      [[ -n $pr ]] || pr=$(gh pr view "$pr_url" --json "$PR_FIELDS" </dev/null) ||
         { log "can't read $pr_url"; continue; }
       case $(jq -r .state <<<"$pr") in
         OPEN)
           branch=$(jq -r .headRefName <<<"$pr")
-          issue=$(gh_list "repos/$repo/issues/$pr_number/comments?per_page=100") &&
-            reviews=$(gh_list "repos/$repo/pulls/$pr_number/reviews?per_page=100") &&
-            inline=$(gh_list "repos/$repo/pulls/$pr_number/comments?per_page=100") ||
-            { log "can't read the comments on $pr_url"; continue; }
-          ci=$(ci_status "$repo" "$(jq -r .headRefOid <<<"$pr")") ||
-            { log "can't read the checks on $pr_url"; continue; }
+          if ! read_pr_feedback "$id" "$pr_url" "$repo" "$pr_number" "$pr"; then continue; fi
           ;;
         CLOSED)
           if [[ $column == "$review" ]]; then
@@ -151,8 +204,10 @@ handle_feedback() {
       esac
     fi
 
-    activity=$(get "/tickets/$id/activity") || { log "can't read the activity of $id"; continue; }
     state=$(read_state "$id")
+    # Only the activity newer than what the state has already seen (the lower of its snapshot and its stopped run's).
+    after=$(jq -r '[.activity // 0, (.stopped | objects | .activity // 0)] | min' <<<"$state")
+    activity=$(get "/tickets/$id/activity?afterId=$after") || { log "can't read the activity of $id"; continue; }
     triage=$(printf '%s\n' "$activity" "$pr" "$ci" "$issue" "$reviews" "$inline" "$state" |
       jq -cs --arg agent "$AGENT" --arg loop "$LOOP_ACTOR" --arg marker "$MARKER" --arg working "$IN_PROGRESS_COLUMN" \
         --argjson now "$(date +%s)" --argjson retry "$RETRY_SECONDS" --argjson max "$MAX_ATTEMPTS" \
@@ -186,7 +241,8 @@ so the loop stopped starting runs for conflicts on this ticket. Comment on the t
     fi
     [[ $(jq -r .run <<<"$triage") == true ]] || continue
 
-    use_ticket_worker "$id" "$ticket_model" "$ticket_effort"
+    use_fix_worker "$(jq -r '.trigger // ""' <<<"$triage")" "$fix_runs" ||
+      use_ticket_worker "$id" "$ticket_model" "$ticket_effort"
     adopt "$id" "$number" "$holder" "$version" || continue
     items=$(jq -r '.items | map(.text) | join("\n\n---\n\n")' <<<"$triage")
     run_step=$(jq -r '.items | map(.text | split("\n")[0] | rtrimstr(":")) | join("; ")' <<<"$triage")
@@ -200,9 +256,7 @@ post a revised plan (POST $KANBAN/api/tickets/$id/plan) if it asks for changes t
 otherwise."
     fi
     [[ $CONFLICTS_ONLY == 1 ]] && followup=$id
-    run_on_ticket "$id" "$(intro)
-
-Ticket $id is already yours. The loop started this run for this new feedback:
+    run_on_ticket "$id" "Ticket $id is already yours. The loop started this run for this new feedback:
 
 $items
 
@@ -216,8 +270,9 @@ $next$(
 Failing CI started this run. First find out from the failing job's log whether the failure comes from the code. If it
 doesn't (billing or spending limits, runners or infrastructure, a flaky test unrelated to the change, missing
 secrets), don't push anything: explain what you found in the ticket comment and exit.")
-Finish with a ticket comment summarising what you did, then exit.$([[ $approval == pending ]] || unchecked_steps "$id")" \
-      "$(jq -c .snapshot <<<"$triage")" "$(jq -r .fingerprint <<<"$triage")" "$(jq -r .ciRuns <<<"$triage")" "$branch"
+Finish with a ticket comment summarising what you did, then exit." \
+      "$(jq -c .snapshot <<<"$triage")" "$(jq -r .fingerprint <<<"$triage")" "$(jq -r .ciRuns <<<"$triage")" "$branch" \
+      "$([[ $approval == pending ]] && echo 0 || echo 1)"
     unlock_ticket
     return 0
   done 3<<<"$tickets"
@@ -229,7 +284,7 @@ Finish with a ticket comment summarising what you did, then exit.$([[ $approval 
 # in-progress column holds fewer than CLAIM_LIMIT (the board's parallel runs) tickets. Tickets already in progress
 # take up the slots, so the backlog isn't pulled into progress while they're being worked.
 backlog_on() {
-  get "/boards/$BOARD" | jq -e --arg name "$BACKLOG_COLUMN" --arg progress "$IN_PROGRESS_COLUMN" \
+  board | jq -e --arg name "$BACKLOG_COLUMN" --arg progress "$IN_PROGRESS_COLUMN" \
     --argjson limit "$CLAIM_LIMIT" '
     def column($n): first(.columns[] | select((.name | ascii_downcase) == ($n | ascii_downcase)) | .id) // null;
     column($progress) as $p
@@ -330,14 +385,16 @@ their first run yet (CLAIM_LIMIT $CLAIM_LIMIT)"
   write_state "$id" "$(jq -c '. + {claim: true}' <<<"$snapshot")"
   claim_unlock
   run_step="Working the ticket"
-  run_on_ticket "$id" "$(intro)
-
-Ticket $id is already claimed for you and in progress. Work only this ticket; do not claim another.
+  plan_note=
+  if get "/boards/$BOARD" | jq -e '.board.approvalSize == null' >/dev/null 2>&1; then
+    plan_note=" No plans wait for approval on this board, so for a small ticket a one-line plan is enough (or skip it)."
+  fi
+  run_on_ticket "$id" "Ticket $id is already claimed for you and in progress. Work only this ticket; do not claim another.
 Take it through to review and exit after submitting it. If it is tagged question, submit it for review with the answer \
 as the comment and no pull request.
-Before you start the work, post your plan with its size estimate (POST $KANBAN/api/tickets/$id/plan, see the skill). If \
+Before you start the work, post your plan with its size estimate (POST $KANBAN/api/tickets/$id/plan, see the skill).$plan_note If \
 the ticket then waits for approval (its \"approval\" is \"pending\"), stop there and exit: the loop starts a new run once \
-someone approves the plan.$(unchecked_steps "$id")" "$snapshot" "claim"
+someone approves the plan." "$snapshot" "claim"
   unlock_ticket
   return 0
 }

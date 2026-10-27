@@ -46,7 +46,8 @@ export function RunStatus({
   return (
     <div
       className={cn(
-        'mt-2 flex min-w-0 items-center gap-1.5 text-[11px]',
+        // Its buttons drop to a line of their own when they don't fit next to the status, as on the card's meta row.
+        'mt-2 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px]',
         stalled || stopping ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400',
         className,
       )}
@@ -60,7 +61,10 @@ export function RunStatus({
         {stopping ? 'Stopping…' : stalled ? `No heartbeat for ${formatDuration(silentMs)}` : `Running ${elapsed}`}
         {tokens && <> · {tokens}</>}
       </span>
-      {!stalled && !stopping && run.step && <span className="truncate text-muted-foreground">· {run.step}</span>}
+      {/* No width of its own, so it takes what the line has left instead of wrapping onto one of its own. */}
+      {!stalled && !stopping && run.step && (
+        <span className="min-w-0 flex-1 basis-0 truncate text-muted-foreground">· {run.step}</span>
+      )}
       {(!stopping || children) && (
         <div className="-my-1 ml-auto flex shrink-0 items-center gap-1 pl-1">
           {!stopping && <StopRunButton ticket={ticket} />}

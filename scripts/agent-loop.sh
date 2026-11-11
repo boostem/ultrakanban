@@ -42,8 +42,8 @@
 # also sends the board a heartbeat for the ticket (POST /tickets/:id/heartbeat): the board counts tickets without one
 # (and without other activity) for 10 minutes as idle, and offers to move them back to the todo column. The heartbeats
 # say what the run is doing (its latest tool call, read from its output every RUN_STEP_SECONDS, or before its first one
-# what it is for: working the ticket, or the feedback it answers) and how many tokens it has used so far, and the loop
-# tells the board when the run ends, so the ticket's card shows the run while it goes on.
+# what it is for: working the ticket, or the feedback it answers), its tool calls so far and how many tokens it has
+# used so far, and the loop tells the board when the run ends, so the ticket shows the run while it goes on.
 #
 # People can also stop a run without taking the ticket away, to give the agent new instructions (the Stop button,
 # POST /tickets/:id/stop). The same check of the ticket sees that and stops the run, but keeps its session and its
@@ -72,7 +72,8 @@
 #
 # Runs clean up after themselves, so nothing they leave holds memory or swap for good: each run's TMPDIR is a scratch
 # directory of its ticket's on disk (STATE_DIR/tmp/<ticket>), removed once a run on the ticket finishes, and when a run
-# ends the loop stops whatever it left running (see stop_leftovers in agent-loop/run.sh).
+# ends the loop stops whatever it left running: its systemd scope, and what has its marker (see run_scope and
+# stop_leftovers in agent-loop/run.sh).
 #
 # Each run's token usage (from the result at the end of claude's stream-json output) is reported to the board with
 # POST /tickets/:id/usage, so the overview can show how many tokens each agent uses; a run that ended without a result
@@ -147,11 +148,14 @@
 #   TICKET_TIMEOUT      stop a run that takes longer than this, as accepted by timeout(1) (default: 4h)
 #   TICKET_CHECK_SECONDS  how often a run's ticket is checked for having been taken away from the agent or for a
 #                       request to stop the run, and a heartbeat sent for it; keep it well under 10 minutes (default: 30)
-#   RUN_STEP_SECONDS    how often a run's latest tool call is read from its output and, when it changed, sent to the
-#                       board as the run's step, so the ticket shows what the run does as it goes; 0 shows only what the
-#                       run is for (working the ticket, or the feedback it answers) (default: 10)
+#   RUN_STEP_SECONDS    how often a run's latest tool call and its tool calls so far are read from its output and,
+#                       when they changed, sent to the board as the run's step and steps, so the ticket shows what the
+#                       run does as it goes; 0 shows only what the run is for (working the ticket, or the feedback it
+#                       answers) (default: 10)
 #   INHIBIT_SLEEP       1 keeps the machine from suspending or going idle while a run is going (a systemd-logind
 #                       inhibitor lock, where systemd-inhibit is available), 0 doesn't (default: 1)
+#   RUN_SCOPE           1 starts each run in a systemd scope of its own, where systemd-run can, so that everything it
+#                       started is stopped when it ends; 0 stops only what still has the run's marker (default: 1)
 #   RETRY_SECONDS       wait before retrying a failed run, doubled after each failure (default: 600)
 #   USAGE_CHECK_SECONDS how often, while out of Claude usage, the board's usage report is read to see whether it is
 #                       back before the time claude's limit message gave (default: 60)
@@ -228,6 +232,7 @@ TICKET_TIMEOUT=${TICKET_TIMEOUT:-4h}
 TICKET_CHECK_SECONDS=${TICKET_CHECK_SECONDS:-30}
 RUN_STEP_SECONDS=${RUN_STEP_SECONDS:-10}
 INHIBIT_SLEEP=${INHIBIT_SLEEP:-1}
+RUN_SCOPE=${RUN_SCOPE:-1}
 RETRY_SECONDS=${RETRY_SECONDS:-600}
 USAGE_CHECK_SECONDS=${USAGE_CHECK_SECONDS:-60}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
@@ -356,6 +361,7 @@ if [[ ${1:-} == save-work ]]; then
   exit
 fi
 
+check_scopes
 rm -f "$WAKE_FILE"
 listen_for_wakes &
 listener=$!

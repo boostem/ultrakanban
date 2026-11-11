@@ -95,26 +95,44 @@ current_tokens() {
   grep -F '"type":"assistant"' "$1" 2>/dev/null | jq -nR "$RUN_TOKENS" 2>/dev/null
 }
 
+# A run's tool calls (RUN_SUMMARY's steps) as its record and heartbeats hold them, {steps, omittedSteps}: a run of more
+# than 150 (RUN_MAX_STEPS) keeps its first and last 75, saying how many were left out between them.
+read -r -d '' CLIP_STEPS <<'JQ'
+def clip_steps:
+  75 as $half
+  | length as $count
+  | if $count > 2 * $half then
+      {steps: (.[:$half] + .[($count - $half):]), omittedSteps: {after: $half, count: ($count - 2 * $half)}}
+    else {steps: ., omittedSteps: null} end;
+JQ
+
+# Prints the tool calls so far of the run whose output (claude's stream-json) is in the given file, for its heartbeat,
+# as {steps, omittedSteps} (see CLIP_STEPS), so the ticket shows them while the run goes on rather than only once it is
+# recorded. Reads only the lines that can hold them: its tool calls and the tool results that reported an error.
+current_steps() {
+  grep -F -e '"type":"tool_use"' -e '"is_error":true' "$1" 2>/dev/null |
+    jq -nRc --arg cwd "$PWD" "$CLIP_STEPS
+$RUN_SUMMARY
+| .steps | clip_steps" 2>/dev/null
+}
+
 # A run's record, the body of POST /tickets/:id/runs (see RunRecord in shared/domain.ts), from RUN_SUMMARY's output
 # and what the loop knows: $outcome, the exit $code, the $duration in ms, the run's $usage (USAGE's output, or null)
 # for its tokens and cost, whether it went on the agents' API key ($apiKey), and the end of what claude printed to stderr
 # ($errors), the message of a run that left no other.
-# The message is clipped to 4000 characters (RUN_MESSAGE_MAX), and a run of more than 150 tool calls (RUN_MAX_STEPS)
-# keeps its first and last 75, saying how many were left out between them.
+# The message is clipped to 4000 characters (RUN_MESSAGE_MAX), and the steps as CLIP_STEPS says.
 read -r -d '' RUN_RECORD <<'JQ'
 def clip($n): if length > $n then .[:($n - 1)] + "…" else . end;
-75 as $half
-| (.steps // []) as $steps
-| ($steps | length) as $count
-| {agent: $agent, outcome: $outcome, exitCode: $code, durationMs: $duration,
+{agent: $agent, outcome: $outcome, exitCode: $code, durationMs: $duration,
    turns: (.result.num_turns // .turns // null),
    tokens: (($usage | objects | .inputTokens + .outputTokens + .cacheReadTokens + .cacheWriteTokens) // null),
    costUsd: (($usage | objects | .costUsd) // null), apiKey: $apiKey,
    message: (((.result.result // .text // (.output // [] | join("\n"))) | strings | select(test("\\S"))) // $errors
-     | clip(4000)),
-   steps: (if $count > 2 * $half then $steps[:$half] + $steps[($count - $half):] else $steps end),
-   omittedSteps: (if $count > 2 * $half then {after: $half, count: ($count - 2 * $half)} else null end)}
+     | clip(4000))}
++ (.steps // [] | clip_steps)
 JQ
+RUN_RECORD="$CLIP_STEPS
+$RUN_RECORD"
 
 # The tokens a run used, from the result object of claude's output (every model it called, subagents included), in all
 # and per model, as the body of POST /tickets/:id/usage. Claude prices models it doesn't know (another provider's, or
@@ -202,11 +220,12 @@ stop_reason() {
 # takes the ticket away from the agent or asks for the run to stop, writing why to the given file (see stop_reason).
 # Each check also tells the board the agent is working on the ticket, so the board doesn't count it as idle. Every
 # RUN_STEP_SECONDS it also reads the run's latest tool call from its output file (see current_step), and tells the
-# board when it changed, so the ticket shows what the run does as it goes. Each heartbeat also says how many tokens
-# the run has used so far (see current_tokens), so a runaway run shows while it goes on.
+# board when it changed, so the ticket shows what the run does as it goes, with its tool calls so far (see
+# current_steps; sent only when they changed). Each heartbeat also says how many tokens the run has used so far (see
+# current_tokens), so a runaway run shows while it goes on.
 watch_run() {
   local id=$1 pid=$2 file=$3 output=$4 idle= reason step due checked=$SECONDS interval=$TICKET_CHECK_SECONDS
-  local run_tokens=
+  local run_tokens= run_steps= steps sent_steps= heartbeat_failed=
   trap - INT TERM
   if [[ -n $lock_fd ]]; then exec {lock_fd}>&-; fi
   ((RUN_STEP_SECONDS > 0 && RUN_STEP_SECONDS < interval)) && interval=$RUN_STEP_SECONDS
@@ -221,7 +240,13 @@ watch_run() {
       continue
     fi
     run_tokens=$(current_tokens "$output")
+    run_steps=
+    if ((RUN_STEP_SECONDS > 0)); then
+      steps=$(current_steps "$output")
+      [[ $steps == "$sent_steps" ]] || run_steps=$steps
+    fi
     heartbeat "$id"
+    [[ -z $run_steps || -n $heartbeat_failed ]] || sent_steps=$run_steps
     if [[ -n $stop_requested_by ]]; then
       printf 'requested\t%s\n' "$stop_requested_by" >"$file"
       log "ticket $id: $stop_requested_by asked for its run to stop; stopping it"
@@ -268,16 +293,62 @@ make_scratch() {
 
 remove_scratch() { rm -rf "$(scratch_dir "$1")"; }
 
-# Stops what a run left running when it ended, such as a dev server it started in the background: every process
-# that still has the run's ULTRAKANBAN_RUN marker in its environment, including those that left its process group.
+# Each run goes in a systemd scope of its own, ultrakanban-run-<run>.scope in app-ultrakanban.slice, so that when it
+# ends everything it started can be stopped, whatever environment that was started with (env -i, or a script's
+# subprocess given an environment of its own), not only what still has its ULTRAKANBAN_RUN marker. The scope is part of
+# the loop's own unit, if the loop runs in one, so stopping the loop stops its runs too. Not with RUN_SCOPE=0, or
+# where systemd-run can't start a user scope (macOS, Docker, no user manager): then only the marker is used.
+scope_unit() { printf 'ultrakanban-run-%s.scope' "$1"; }
+
+# Finds out whether runs can go in scopes of their own (see above), once as the loop starts: sets scope_base to the
+# start of the command a run starts in (empty if they can't), and scope_part_of to the loop's own unit.
+check_scopes() {
+  local expand
+  scope_base=() scope_part_of=
+  [[ $RUN_SCOPE == 1 ]] && command -v systemd-run >/dev/null || return 0
+  # systemd 254 and later expand $VARIABLES in the command (claude's arguments) unless told not to; older ones
+  # neither do nor know the option.
+  for expand in --expand-environment=no ''; do
+    if systemd-run --user --scope --quiet --collect --slice=app-ultrakanban.slice ${expand:+"$expand"} true </dev/null >/dev/null 2>&1; then
+      scope_base=(systemd-run --user --scope --quiet --collect --slice=app-ultrakanban.slice ${expand:+"$expand"})
+      scope_part_of=$(sed -n 's|^0::.*/\([^/]*\.service\)$|\1|p' /proc/self/cgroup 2>/dev/null)
+      return 0
+    fi
+  done
+  log "can't start runs in systemd scopes of their own; when a run ends, only what has its marker is stopped"
+}
+
+# Sets scope_args to the command the given run (on the given ticket) starts in, before timeout: none when runs don't
+# go in scopes.
+run_scope() {
+  scope_args=()
+  ((${#scope_base[@]})) || return 0
+  scope_args=("${scope_base[@]}" --unit="$(scope_unit "$1")" --description="ultrakanban run on ticket $2"
+    -p TimeoutStopSec=5 ${scope_part_of:+-p "PartOf=$scope_part_of"} --)
+}
+
+# The names of the given processes, once each, comma separated.
+process_names() { ps -o comm= -p "$(IFS=,; echo "$*")" | sort -u | paste -sd, -; }
+
+# Stops what a run left running when it ended, such as a dev server it started in the background: its scope (see
+# run_scope), with everything still in it, then every process that still has the run's ULTRAKANBAN_RUN marker in its
+# environment, including those that left its process group.
 stop_leftovers() {
-  local id=$1 run=$2 proc pid pids=() left i
+  local id=$1 run=$2 unit cgroup proc pid pids=() left i
+  unit=$(scope_unit "$run")
+  # A scope that emptied when the run ended is already gone.
+  if ((${#scope_base[@]})) && cgroup=$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null) &&
+    [[ -n $cgroup ]]; then
+    mapfile -t pids < <(find "/sys/fs/cgroup$cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null)
+    ((${#pids[@]})) && log "ticket $id: stopping what its run left running: $(process_names "${pids[@]}")"
+    systemctl --user stop "$unit" 2>/dev/null
+    pids=()
+  fi
   for proc in /proc/[0-9]*; do
     [[ -O $proc ]] && grep -qzxF "ULTRAKANBAN_RUN=$run" "$proc/environ" 2>/dev/null && pids+=("${proc#/proc/}")
   done
   ((${#pids[@]})) || return 0
-  log "ticket $id: stopping what its run left running: $(ps -o comm= -p "$(IFS=,; echo "${pids[*]}")" |
-    sort -u | paste -sd, -)"
+  log "ticket $id: stopping what its run left running: $(process_names "${pids[@]}")"
   kill -TERM "${pids[@]}" 2>/dev/null
   for i in 1 2 3 4 5; do
     left=()
@@ -418,7 +489,7 @@ record_run() {
 # claude_subtype is the subtype of the run's result, e.g. error_max_budget_usd for one that reached that cap.
 run_claude() {
   local id=$1 prompt=$2 output errors stopped code usage=null response scratch= run started summary kind= reason= \
-    budget_args=()
+    budget_args=() scope_args=()
   shift 2
   output=$(mktemp) && errors=$(mktemp) && stopped=$(mktemp) || return 1
   use_skills
@@ -445,6 +516,7 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
   max_turns=$(board | jq -r '.board.agentMaxTurns // empty' 2>/dev/null)
   [[ $max_turns =~ ^[0-9]+$ ]] || max_turns=
   run=$(new_session_id)
+  run_scope "$run" "$id"
   started=$(date +%s%3N)
   (
     # Without the ticket lock's descriptor: anything claude leaves running mustn't keep the ticket locked.
@@ -455,7 +527,7 @@ in memory and is never cleaned up. \$TMPDIR is on disk, and the loop empties it 
     # The agents' API key reaches only a run that goes on it, as claude's own.
     if [[ -n $api_key_budget ]]; then export ANTHROPIC_API_KEY=$AGENT_API_KEY; fi
     unset AGENT_API_KEY
-    exec timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
+    exec ${scope_args[@]+"${scope_args[@]}"} timeout --foreground -k "${TICKET_KILL_AFTER:-30}" "$TICKET_TIMEOUT" ${docker_args[@]+"${docker_args[@]}"} claude -p ${claude_args[@]+"${claude_args[@]}"} \
       ${skill_args[@]+"${skill_args[@]}"} ${budget_args[@]+"${budget_args[@]}"} ${max_turns:+--max-turns "$max_turns"} --model "$model" --effort "$effort" \
       --output-format stream-json --verbose "$@"
   ) <<<"$prompt" >"$output" 2>"$errors" &

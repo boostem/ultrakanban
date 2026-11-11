@@ -51,12 +51,12 @@ curl -s -X POST $KANBAN/api/tickets/$TICKET/checklist/0 -H 'Content-Type: applic
 ```
 
 Post a comment on a notable decision or when blocked: `POST /api/tickets/$TICKET/comments` with `{"body":"<markdown>"}`.
-Every pull request has pictures in its description: screenshots or a recording of a visible change, or for a change
-with nothing to look at a picture of the evidence that it works (test or command output, an API response). Attach them
-to the ticket (`POST /api/tickets/$TICKET/attachments -F file=@shot.png`: PNG, JPEG, GIF, WebP, MP4, WebM, up to
-25 MB). GitHub can't load the board's attachments: for the pull request put the files on origin's `pr-images` branch
-with this function and paste the markdown it prints into the body (recordings as GIF). On a board with a local
-repository, put `![](/api/attachments/<id>)` in the local pull request's body instead.
+Every pull request has pictures in its description: screenshots or a recording of a visible change, or for a change with
+nothing to look at a picture of the evidence that it works (test or command output, an API response). Attach them to the
+ticket (`POST /api/tickets/$TICKET/attachments -F file=@shot.png`: PNG, JPEG, GIF, WebP, MP4, WebM are shown inline,
+other files are downloads; up to 25 MB). GitHub can't load the board's attachments: for the pull request put the files
+on origin's `pr-images` branch with this function and paste the markdown it prints into the body (recordings as GIF). On
+a board with a local repository, put `![](/api/attachments/<id>)` in the local pull request's body instead.
 
 ```sh
 pr_images() {  # pr_images FILE...: puts the files on origin's pr-images branch, prints markdown for each

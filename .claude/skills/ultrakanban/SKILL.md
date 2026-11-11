@@ -142,7 +142,8 @@ visible change (UI, styling, charts, CLI output), screenshots or a short screen 
 that helps. For a change with nothing to look at, a picture of the evidence that it works: the tests or the command
 you ran and their output, an API response, a log. A terminal capture is fine; crop each picture to what matters.
 
-Attach them to the ticket too. PNG, JPEG, GIF, WebP, MP4 or WebM, up to 25 MB each:
+Attach them to the ticket too. PNG, JPEG, GIF, WebP, MP4 or WebM are shown inline; any other file (logs,
+archives) can be attached too and is offered as a download. Up to 25 MB each:
 
 ```sh
 curl -s -X POST $KANBAN/api/tickets/$TICKET/attachments -H "X-Actor: $ME" -F file=@screenshot.png
@@ -293,7 +294,6 @@ a GitHub pull request, and push with `git push --force-with-lease`.
 | `409 pull_request_exists`     | The branch or ticket has an open local pull request: push to its branch.   |
 | `404 no_ticket_available`     | Nothing to claim right now.                                                |
 | `429 usage_reserve_reached`   | Claude usage is kept for people. Stop and report it.                       |
-| `415 unsupported_media_type`  | Attachments must be PNG, JPEG, GIF, WebP, MP4 or WebM.                     |
 
 ## Creating tickets
 

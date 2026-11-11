@@ -24,7 +24,7 @@ JSON over HTTP. Base URL: `http://127.0.0.1:4317/api` (in development the Vite d
   - `409 cannot_merge` - the ticket's pull request can't be merged now (draft, conflicts, builds on another in review).
   - `409 merge_conflicts` / `merge_failed` - a local pull request can't be merged (see [Local pull requests](#local-pull-requests)).
   - `502 git_error` - git failed in the board's local repository; the message says how.
-  - `413 payload_too_large` / `415 unsupported_media_type` - attachments must be PNG, JPEG, GIF, WebP, MP4 or WebM, up to 25 MB.
+  - `413 payload_too_large` - attachments can be at most 25 MB from an agent, 1 GB from a person (see [Attachments](#attachments)).
 
 Columns, tags and epics can be referenced **by id or by name** (an epic's title) (case-insensitive) wherever a request field says `ref`.
 Unknown tag names are created automatically when creating or updating tickets.
@@ -415,6 +415,12 @@ interface AgentRun {
   stopRequested: { at: string; by: string } | null // when someone asked it to stop (POST /tickets/:id/stop) and who, until it ends
 }
 
+// GET /tickets/:id/run: the run with its tool calls so far, as its heartbeats tell (see Run records for RunStep)
+interface LiveRun extends AgentRun {
+  steps: RunStep[] // in order, not its subagents'; empty until its agent sends them
+  omittedSteps: { after: number; count: number } | null // as in RunRecord, for a run of more than 150 tool calls
+}
+
 interface ChecklistItem {
   index: number // 0-based, among the description's checklist items
   text: string
@@ -578,7 +584,11 @@ Heartbeats also make up the ticket's `run`, which its card shows: a heartbeat st
 and can say what the run is doing (`step`) and how many tokens it has used so far (`tokens`); a heartbeat without them
 keeps the run's. `scripts/agent-loop.sh` sends the run's latest tool call as its step (e.g. `Bash: npm test`) when it
 changes, checked every `RUN_STEP_SECONDS`, and its tokens so far with every heartbeat, so a runaway run shows while
-it goes on. The run ends with `DELETE /tickets/:ticketId/heartbeat`, or after 10 minutes without a heartbeat.
+it goes on. A heartbeat can also hold the run's tool calls so far (`steps` and `omittedSteps`, as in a run record:
+see Run records), so people can follow what it does in the ticket's activity while it goes on rather than once it is
+recorded; `GET /tickets/:ticketId/run` gives them, with the run (`LiveRun`, or `null` while no run is going on). The
+loop sends them when they changed, read from the run's output along with its step. The run ends with
+`DELETE /tickets/:ticketId/heartbeat`, or after 10 minutes without a heartbeat, and its tool calls go with it.
 Cards show a run as stalled after 3 minutes without one.
 
 A heartbeat answers `200 {"stopRequested": {"at", "by"} | null}`: whether someone asked the run to stop (see below), so
@@ -610,7 +620,8 @@ and end the run.
 | POST   | `/tickets/:ticketId/move`              | `{ column: ref, position?, ifVersion?, force? }`                                                                                                                                                                                                                                                             | `Ticket` (appended when `position` is omitted)                                                                                                                                                                                                                                                                       |
 | POST   | `/tickets/:ticketId/claim`             | `{ agent, moveTo?: ref, ifVersion? }`                                                                                                                                                                                                                                                                        | `Ticket`, with `routed` on a board whose Jev mode is `on` (see [Routing](#routing)); `409` if claimed by someone else (idempotent for the same agent), `409 blocked` if `claim-next` would skip it, `429 usage_reserve_reached` as for `claim-next`                                                                  |
 | POST   | `/tickets/:ticketId/release`           | `{ agent, moveTo?: ref, force? }`                                                                                                                                                                                                                                                                            | `Ticket`; `409` if claimed by someone else unless `force`                                                                                                                                                                                                                                                            |
-| POST   | `/tickets/:ticketId/heartbeat`         | `{ step?, tokens? }` (optional)                                                                                                                                                                                                                                                                              | `200 { stopRequested }`; says an agent is working on the ticket right now (not a change: nothing is logged), and answers whether someone asked its run to stop (see Stopping a run)                                                                                                                                  |
+| POST   | `/tickets/:ticketId/heartbeat`         | `{ step?, tokens?, steps?, omittedSteps? }` (optional)                                                                                                                                                                                                                                                       | `200 { stopRequested }`; says an agent is working on the ticket right now (not a change: nothing is logged), and answers whether someone asked its run to stop (see Stopping a run)                                                                                                                                  |
+| GET    | `/tickets/:ticketId/run`               |                                                                                                                                                                                                                                                                                                              | `LiveRun \| null`; the run working the ticket with its tool calls so far (see below)                                                                                                                                                                                                                                 |
 | DELETE | `/tickets/:ticketId/heartbeat`         |                                                                                                                                                                                                                                                                                                              | `204`; says the agent's run on the ticket has ended                                                                                                                                                                                                                                                                  |
 | POST   | `/tickets/:ticketId/stop`              |                                                                                                                                                                                                                                                                                                              | `Ticket` with `run.stopRequested` set: asks the run working it to stop (see Stopping a run); `409 no_run` without one                                                                                                                                                                                                |
 | POST   | `/boards/:boardId/tickets/bulk`        | `{ tickets: ref[], moveTo?: ref, force?, priority?, addTags?: ref[], removeTags?: ref[], epic?: ref \| null, agentModel?: string \| null, agentEffort?: string \| null }` or `{ tickets: ref[], delete: true }`                                                                                              | `{ tickets: Ticket[] }`: the same change to several tickets, all or nothing (e.g. `409` if one can't enter the done column, unless `force`); moved tickets are appended in the order given; `tickets: []` when deleted                                                                                               |
@@ -828,9 +839,10 @@ interface RoutingComparison {
 
 Agents also record what each run on a ticket did and how it ended, so people can see why an agent is stuck without
 reading its logs: the ticket's activity shows each run, collapsed to how long it took and how it ended, opening to its
-final message and the tool calls it made. `scripts/agent-loop.sh` records every run it starts, whether it finished,
-failed, timed out or was killed, from claude's `--output-format stream-json` output (see [Agents](agents.md)). Unlike
-token usage, a run is recorded even when it ended without a result.
+final message and the tool calls it made, and the run going on, opening to its tool calls so far (see the heartbeats
+under Columns and tags). `scripts/agent-loop.sh` records every run it starts, whether it finished, failed, timed out or
+was killed, from claude's `--output-format stream-json` output (see [Agents](agents.md)). Unlike token usage, a run is
+recorded even when it ended without a result.
 
 | Method | Path                      | Body / query                                                                                                                                             | Returns                                       |
 | ------ | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
@@ -918,9 +930,12 @@ interface AgentSettingStats {
 
 ## Attachments
 
-Screenshots and screen recordings on tickets. Upload one file per request as `multipart/form-data` in a field named
-`file`; the type is detected from the file contents (PNG, JPEG, GIF, WebP, MP4 or WebM, up to 25 MB). Uploads and
-deletions appear in the ticket's activity. Attachments are not included in board exports.
+Screenshots, screen recordings and any other files (archives, logs, documents) on tickets. Agents (an `X-Actor` of the
+form `<agent>/<model>/<effort>`) can upload up to 25 MB each, people (any other `X-Actor`, e.g. `me` from the UI) up to
+1 GB. Upload one file per request as `multipart/form-data` in a field named `file`. The type is detected from the file contents, not
+the declared one: PNG, JPEG, GIF, WebP, MP4 and WebM are shown in the browser; anything else is stored as
+`application/octet-stream` and always served as a download (`Content-Disposition: attachment`). Uploads and deletions
+appear in the ticket's activity. Attachments are not included in board exports.
 
 | Method | Path                             | Body             | Returns                       |
 | ------ | -------------------------------- | ---------------- | ----------------------------- |
@@ -934,11 +949,12 @@ interface Attachment {
   id: string
   ticketId: string
   filename: string
-  contentType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | 'video/mp4' | 'video/webm'
+  contentType:
+    'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | 'video/mp4' | 'video/webm' | 'application/octet-stream'
   size: number // bytes
   actor: string
   createdAt: string
-  url: string // /api/attachments/:id, also usable in markdown: ![screenshot](/api/attachments/:id)
+  url: string // /api/attachments/:id, also usable in markdown: ![screenshot](/api/attachments/:id) or [logs.zip](/api/attachments/:id)
 }
 ```
 
@@ -1186,6 +1202,7 @@ interface BoardDiskBreakdown {
   attachments: {
     images: { count: number; bytes: number } // screenshots: PNG, JPEG, GIF, WebP
     videos: { count: number; bytes: number } // screen recordings: MP4, WebM
+    files: { count: number; bytes: number } // any other file
     finished: { count: number; bytes: number } // those of finished tickets, which the cleanup deletes
     tickets: { ticketId: string; number: number; title: string; finished: boolean; count: number; bytes: number }[] // the 10 largest
   }

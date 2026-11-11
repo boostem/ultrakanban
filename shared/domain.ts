@@ -480,8 +480,8 @@ export interface MergeRun {
   steps: MergeRunStep[]
 }
 
-/** Screenshots and screen recordings. SVG is excluded because it can carry scripts. */
-export const ATTACHMENT_TYPES = [
+/** Screenshots and screen recordings, which the board shows inline. SVG is excluded because it can carry scripts. */
+export const MEDIA_ATTACHMENT_TYPES = [
   'image/png',
   'image/jpeg',
   'image/gif',
@@ -489,8 +489,26 @@ export const ATTACHMENT_TYPES = [
   'video/mp4',
   'video/webm',
 ] as const
-export type AttachmentType = (typeof ATTACHMENT_TYPES)[number]
+export type MediaAttachmentType = (typeof MEDIA_ATTACHMENT_TYPES)[number]
+/** Any other file (archives, logs, PDFs...): stored as is and only ever served as a download. */
+export const FILE_ATTACHMENT_TYPE = 'application/octet-stream'
+export type AttachmentType = MediaAttachmentType | typeof FILE_ATTACHMENT_TYPE
+export const isMediaAttachment = (type: string): type is MediaAttachmentType =>
+  (MEDIA_ATTACHMENT_TYPES as readonly string[]).includes(type)
+/** Largest attachment an agent (an `<agent>/<model>/<effort>` name, see `parseWorkerName`) can upload. */
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+/** Largest attachment a person (any other `X-Actor`, e.g. `me` from the UI) can upload. */
+export const MAX_PERSON_ATTACHMENT_BYTES = 1024 * 1024 * 1024
+
+/** Largest attachment `actor` can upload: agents are held to `MAX_ATTACHMENT_BYTES`, people get more. */
+export const maxAttachmentBytes = (actor: string) =>
+  parseWorkerName(actor) ? MAX_ATTACHMENT_BYTES : MAX_PERSON_ATTACHMENT_BYTES
+
+/** The limit as people read it, e.g. `25 MB` or `1 GB`. */
+export function formatAttachmentLimit(bytes: number) {
+  const mb = bytes / 1024 / 1024
+  return mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`
+}
 
 export interface Attachment {
   id: string
@@ -500,7 +518,10 @@ export interface Attachment {
   size: number
   actor: string
   createdAt: string
-  /** Path on the server, e.g. `/api/attachments/abc`; usable in markdown as `![screenshot](/api/attachments/abc)`. */
+  /**
+   * Path on the server, e.g. `/api/attachments/abc`; usable in markdown as `![screenshot](/api/attachments/abc)`, or
+   * `[logs.zip](/api/attachments/abc)` for a file that isn't an image.
+   */
   url: string
 }
 
@@ -886,6 +907,18 @@ export interface AgentRun {
    * while nobody has.
    */
   stopRequested: { at: string; by: string } | null
+}
+
+/**
+ * The run working a ticket with the tool calls it has made so far (`GET /tickets/:id/run`), as its heartbeats tell,
+ * so people can follow what it does while it goes on rather than once its record (see `RunRecord`) comes in at its
+ * end. Like a record's, its steps hold at most `RUN_MAX_STEPS`: the first and last ones of a longer run.
+ */
+export interface LiveRun extends AgentRun {
+  /** Its tool calls so far, in order (not its subagents'); empty until its agent sends them. */
+  steps: RunStep[]
+  /** How many steps were left out between `steps[after - 1]` and `steps[after]`; null when none were. */
+  omittedSteps: { after: number; count: number } | null
 }
 
 export interface BoardDetail {
@@ -1364,6 +1397,8 @@ export interface BoardDiskBreakdown {
     images: AttachmentBytes
     /** Screen recordings: MP4 and WebM. */
     videos: AttachmentBytes
+    /** Any other file: archives, logs, documents. */
+    files: AttachmentBytes
     /** Those of finished tickets (in the done or Cancelled column), which `POST /boards/:id/attachments/cleanup` deletes. */
     finished: AttachmentBytes
     /** The tickets whose attachments take the most space, largest first (at most `DISK_USAGE_TICKETS`). */
